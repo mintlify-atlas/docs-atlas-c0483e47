@@ -1,0 +1,122 @@
+---
+title: "Gardener Architecture: Garden, Seed, and Shoot Clusters"
+description: "How Gardener's garden, seed, and shoot cluster model works, where control planes live, and how components manage Kubernetes cluster lifecycle."
+---
+
+The foundation of Gardener — providing Kubernetes clusters as a service — is Kubernetes itself. Kubernetes is the go-to solution for managing software in the cloud, even when that software is Kubernetes itself. Gardener applies a special pattern to provision hundreds or even thousands of clusters, catering to the needs of cloud platform operators.
+
+## The three cluster types
+
+Gardener's architecture is built around three distinct cluster roles. Understanding the relationship between them is the key to understanding how Gardener works.
+
+<CardGroup cols={3}>
+  <Card title="Garden cluster" icon="seedling">
+    The central management cluster. Hosts Gardener's API server, controller manager, and scheduler. All Shoot custom resources live here.
+  </Card>
+  <Card title="Seed cluster" icon="server">
+    One per IaaS provider and region. Hosts the control planes of many Shoot clusters as regular pod workloads.
+  </Card>
+  <Card title="Shoot cluster" icon="leaf">
+    End-user Kubernetes clusters. Worker nodes only — the control plane is entirely hosted in the seed.
+  </Card>
+</CardGroup>
+
+## How control planes are hosted in seeds
+
+The central innovation in Gardener is where shoot control planes run. Rather than provisioning dedicated master VMs for each shoot cluster, Gardener deploys the control plane — etcd, API server, controller manager, scheduler, and related components — as native Kubernetes workloads inside a seed cluster.
+
+One seed cluster, deployed once per IaaS provider and region, hosts the control planes of multiple shoot clusters. This approach has significant operational advantages:
+
+- **No dedicated master VMs** — the control plane runs in pods, eliminating the cost of reserved infrastructure
+- **Standard Kubernetes deployments** — control plane components can be updated using rolling updates
+- **Scale only under pressure** — control planes start with a replica count of 1 and scale out only when under load, not for HA reasons by default
+- **Full admin access for users** — because the control plane is isolated in the seed, shoot users can receive full administrative access to their cluster without touching Gardener's infrastructure
+
+<Note>
+The kubelet and pods inside a shoot cluster communicate through the public internet (via a load balancer IP) to reach their API server running in the seed. The reverse path — from the API server to the pod, service, and node networks — uses a VPN connection deployed into both the seed and shoot clusters.
+</Note>
+
+## Component roles and responsibilities
+
+### Gardener API server
+
+Gardener uses the [API server aggregation](https://kubernetes.io/docs/concepts/api-extension/custom-resources/#api-server-aggregation) pattern — a standard Kubernetes extension mechanism. The Gardener API server introduces custom resources (`Shoot`, `Seed`, `CloudProfile`, `Project`, etc.) into the garden cluster without requiring a separate etcd instance in many configurations.
+
+This means `kubectl` and any Kubernetes-native tooling work against Gardener's API exactly as they would against any Kubernetes API, including RBAC, admission webhooks, and resource watches.
+
+### Gardener Controller Manager
+
+A standard Kubernetes controller that watches the custom resources introduced by the API server and acts upon them. It handles the cluster lifecycle: creating namespaces in seed clusters for new shoots, generating credentials, waiting for shoot API servers to become responsive, and deploying system components into live clusters.
+
+### Gardener Scheduler
+
+Assigns incoming `Shoot` resources to appropriate `Seed` clusters based on scheduling strategies. The default strategy considers provider type, region proximity, and seed capacity. Operators can influence scheduling by setting `seedName` or `seedSelector` on a Shoot resource.
+
+### Gardenlet
+
+The per-seed agent — Gardener's equivalent of the kubelet. Just as the kubelet runs on every node and manages pods, the gardenlet runs in every seed cluster and manages the shoot clusters hosted there.
+
+The gardenlet:
+- Bootstraps itself into a seed cluster via a TLS bootstrapping mechanism analogous to kubelet bootstrapping
+- Registers the seed with the garden cluster
+- Watches `Shoot` resources assigned to its seed and reconciles their control planes
+- Reports seed and shoot health back to the garden cluster
+
+### Gardener Dashboard
+
+A central operator web UI that communicates with the garden cluster. It provides a visual interface for managing shoots, seeds, projects, and members. The dashboard uses the same garden cluster API as `kubectl`, meaning all actions taken through it are fully auditable as standard Kubernetes API calls.
+
+## Shoot creation procedure
+
+When a `Shoot` resource is created in the garden cluster, the Gardener Controller Manager follows these steps:
+
+<Steps>
+  <Step title="Create a namespace in the seed">
+    A dedicated namespace is created in the target seed cluster to host all control plane components for the new shoot.
+  </Step>
+  <Step title="Generate credentials">
+    Secrets and credentials are generated for the worker nodes to communicate with the control plane API server.
+  </Step>
+  <Step title="Create infrastructure">
+    Infrastructure resources (primarily network setup) are provisioned on the cloud provider, typically using Terraform-based extensions.
+  </Step>
+  <Step title="Deploy the control plane">
+    The shoot's control plane components — including etcd, kube-apiserver, kube-controller-manager, kube-scheduler, and the machine-controller-manager — are deployed as pods into the shoot namespace in the seed.
+  </Step>
+  <Step title="Provision worker machines">
+    Machine CRDs are created in the seed cluster. The machine-controller-manager watches these CRDs and provisions the actual virtual machines on the cloud provider.
+  </Step>
+  <Step title="Wait for API server readiness">
+    Gardener waits for the shoot API server to become responsive. Kubernetes provisions persistent volumes and load balancers via the cloud provider during this phase.
+  </Step>
+  <Step title="Deploy system components">
+    kube-system daemons (kube-proxy) and add-ons (dashboard, monitoring) are deployed into the shoot cluster itself, and the cluster becomes active.
+  </Step>
+</Steps>
+
+## Architecture diagrams
+
+The Gardener repository includes two architecture diagrams that illustrate these relationships visually.
+
+**Overview diagram** — shows the high-level relationship between the garden cluster, seed clusters, and shoot clusters, along with the Gardener Dashboard and external cloud providers.
+
+**Detailed diagram** — shows the internal component topology within seed clusters, including how the VPN tunnel connects seed and shoot networks, and how the machine-controller-manager provisions worker nodes.
+
+<Tip>
+The detailed architecture diagram in the Gardener source repository is at `docs/concepts/images/gardener-architecture-detailed.png`. It is the most complete reference for understanding the internal networking and component placement.
+</Tip>
+
+## Kubernetes analogy
+
+Gardener's design is an intentional mirror of the Kubernetes architecture itself, applied one level up:
+
+| Kubernetes concept | Gardener equivalent | Role |
+|--------------------|---------------------|------|
+| `kube-apiserver` | `gardener-apiserver` | Serves the management API |
+| Controller Manager | Gardener Controller Manager | Reconciles desired state |
+| Scheduler | Gardener Scheduler | Places workloads on infrastructure |
+| `kubelet` | `gardenlet` | Per-node (per-seed) agent |
+| Node | Seed cluster | Hosts workloads (control planes) |
+| Pod | Shoot cluster | The managed workload |
+
+This familiarity with known Kubernetes concepts has proven to shorten the learning curve significantly for teams already operating Kubernetes infrastructure.

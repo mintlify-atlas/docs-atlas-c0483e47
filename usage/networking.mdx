@@ -1,0 +1,258 @@
+---
+title: Shoot Networking, DNS, and CoreDNS Customization
+description: Configure pod, service, and node CIDRs; choose CNI plugins; use ExposureClasses; enable NodeLocal DNS; customize CoreDNS; and set up dual-stack networking.
+---
+
+Gardener manages all aspects of Shoot cluster networking: IP address allocation, CNI plugin deployment, DNS configuration, and control plane exposure. This page covers the networking options available in the Shoot spec, including CIDR planning, NodeLocal DNS caching, and CoreDNS customization.
+
+## Shoot Networking Spec
+
+The `.spec.networking` section defines the foundational network topology of the Shoot cluster:
+
+```yaml
+spec:
+  networking:
+    type: calico   # calico | cilium | (other provider-registered extensions)
+    ipFamilies:
+    - IPv4         # IPv4 | IPv6 (or both for dual-stack)
+    pods: 100.96.0.0/11
+    nodes: 10.250.0.0/16
+    services: 100.64.0.0/13
+    # providerConfig:
+    #   <CNI-specific configuration>
+```
+
+<Warning>
+The `networking.pods` CIDR and the `nodeCIDRMaskSize` (set in `spec.kubernetes.kubeControllerManager.nodeCIDRMaskSize`) are **immutable** — they cannot be changed after cluster creation. Plan your ranges carefully.
+</Warning>
+
+## Pod CIDR and Node Capacity
+
+The pod CIDR is subdivided into per-node subnets (called `podCIDRs`). The default mask per node is `/24`, controlled by `nodeCIDRMaskSize`. The number of subnets determines the maximum number of nodes:
+
+```yaml
+spec:
+  kubernetes:
+    kubeControllerManager:
+      nodeCIDRMaskSize: 24  # default; immutable after creation
+```
+
+| Pod CIDR | nodeCIDRMaskSize | Max nodes | IPs per node |
+|----------|-----------------|-----------|--------------|
+| `100.96.0.0/16` | `/24` | 256 | 256 |
+| `100.96.0.0/20` | `/24` | 16 | 256 |
+| `100.96.0.0/20` | `/25` | 32 | 128 |
+
+To support more nodes, use a wider pod CIDR or a larger `nodeCIDRMaskSize` (e.g., `/25` gives more subnets but fewer IPs per node).
+
+## Reserved Network Ranges
+
+Some IP ranges are reserved for internal Gardener VPN and control plane use. **Do not use these ranges** for node, pod, or service networks:
+
+| CIDR | Purpose |
+|------|---------|
+| `240.0.0.0/8` | `kubernetes.default.svc.cluster.local` mapping |
+| `241.0.0.0/8` | Seed Pod Mapping (non-HA control planes) |
+| `242.0.0.0/8` | Shoot Node Mapping (non-HA control planes) |
+| `243.0.0.0/8` | Shoot Service Mapping (non-HA control planes) |
+| `244.0.0.0/8` | Shoot Pod Mapping (non-HA control planes) |
+| `fd8f:6d53:b97a:1::/96` | Default VPN Range (IPv6) |
+
+## Overlapping Networks Between Seed and Shoot
+
+IPv4 and dual-stack Shoot clusters can have CIDR ranges that overlap with their seed cluster. Gardener resolves the overlap using double NAT (network address translation) within the VPN tunnel. The reserved mapping ranges listed above are used for this purpose and never appear outside the VPN network.
+
+## Dual-Stack Networking
+
+To configure a dual-stack (IPv4 + IPv6) cluster, list both IP families:
+
+```yaml
+spec:
+  networking:
+    type: calico
+    ipFamilies:
+    - IPv4
+    - IPv6
+    pods: 100.96.0.0/11
+    nodes: 10.250.0.0/16
+    services: 100.64.0.0/13
+```
+
+<Note>
+Single-stack IPv6 Shoots are also supported. Gardener still enforces the non-overlapping condition for IPv6 networks to avoid potential routing issues.
+</Note>
+
+## ExposureClasses
+
+An `ExposureClass` allows you to expose the Shoot's control plane API server through different network environments (internet, corporate intranet, DMZ) without changing the Shoot configuration.
+
+```yaml
+# Reference an ExposureClass in the Shoot spec
+spec:
+  exposureClassName: internet
+```
+
+ExposureClasses are cluster-scoped resources created by Gardener operators. They define a `handler` name that maps to a gardenlet configuration entry on compatible Seeds.
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: ExposureClass
+metadata:
+  name: internet
+handler: internet-config
+scheduling:
+  seedSelector:
+    matchLabels:
+      network/env: internet
+```
+
+<Note>
+The Gardener scheduler merges the seed selectors from both the Shoot and the referenced ExposureClass. If the combined selectors match a seed that does not support the ExposureClass handler, the Shoot will enter an error state.
+</Note>
+
+## NodeLocal DNS
+
+NodeLocal DNS runs a DNS cache daemon on every node, reducing DNS query latency and relieving pressure on the central CoreDNS deployment.
+
+```yaml
+spec:
+  systemComponents:
+    nodeLocalDNS:
+      enabled: true
+      forceTCPToClusterDNS: true       # Upgrade cluster DNS queries from UDP to TCP
+      forceTCPToUpstreamDNS: true      # Upgrade upstream DNS queries to TCP
+      disableForwardToUpstreamDNS: false  # Set true to force all queries through CoreDNS
+```
+
+NodeLocal DNS addresses several known DNS bottlenecks:
+
+- Cloud provider limits on UDP DNS lookups
+- Unreliable UDP connections causing timeout periods
+- Unnecessary node-hops for DNS resolution
+- Inefficient load-balancing in IPTables mode
+
+<Warning>
+Enabling or disabling NodeLocal DNS triggers a **rollout of all shoot worker nodes**. Schedule this change during a maintenance window. There may be a brief disruption in DNS resolution during the transition.
+</Warning>
+
+<Note>
+Custom DNS configurations are fully supported in NodeLocal DNS starting with Gardener v1.132. Prior versions may not function as expected with custom CoreDNS configs when NodeLocal DNS is enabled.
+</Note>
+
+## CoreDNS Autoscaling
+
+Gardener supports two autoscaling modes for CoreDNS:
+
+<Tabs>
+  <Tab title="horizontal (default)">
+    CPU-based HPA. Scales between 2 and 5 CoreDNS replicas based on CPU load. Fully managed — no configuration required.
+
+    ```yaml
+    spec:
+      systemComponents:
+        coreDNS:
+          autoscaling:
+            mode: horizontal
+    ```
+  </Tab>
+  <Tab title="cluster-proportional">
+    Scales the number of CoreDNS replicas based on the number of nodes and CPU cores in the cluster. More configuration flexibility, but does not react to actual DNS load.
+
+    ```yaml
+    spec:
+      systemComponents:
+        coreDNS:
+          autoscaling:
+            mode: cluster-proportional
+    ```
+
+    After enabling, a `coredns-autoscaler` ConfigMap is created in `kube-system` with default settings:
+
+    ```yaml
+    linear: '{"coresPerReplica":256,"min":2,"nodesPerReplica":16}'
+    ```
+
+    Replicas are calculated as:
+
+    ```
+    replicas = max( ceil(cores / coresPerReplica), ceil(nodes / nodesPerReplica) )
+    ```
+
+    You can edit this ConfigMap to adjust the scaling formula.
+  </Tab>
+</Tabs>
+
+## CoreDNS Search Path Rewriting
+
+Gardener can rewrite common DNS search path suffixes to reduce unnecessary search queries. Configure common suffixes to avoid being forwarded to upstream resolvers:
+
+```yaml
+spec:
+  systemComponents:
+    coreDNS:
+      rewriting:
+        commonSuffixes:
+        - gardener.cloud
+        - my-company.internal
+```
+
+## Custom CoreDNS Configuration
+
+You can extend the CoreDNS configuration by editing the `coredns-custom` ConfigMap in the `kube-system` namespace of the Shoot cluster:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  # Add a new DNS server block for the .global domain
+  istio.server: |
+    global:8053 {
+        errors
+        cache 30
+        forward . 1.2.3.4
+    }
+  # Override settings in the main Corefile server block
+  corefile.override: |
+      debug
+      whoami
+```
+
+Keys ending with `.server` add a new server block. Keys ending with `.override` inject configuration into the existing server block. The resulting Corefile looks like:
+
+```
+.:8053 {
+  health { lameduck 15s }
+  ready
+  kubernetes cluster.local in-addr.arpa ip6.arpa {
+      pods insecure
+      fallthrough in-addr.arpa ip6.arpa
+      ttl 30
+  }
+  prometheus :9153
+  loop
+  import custom/*.override   # <-- your .override keys are injected here
+  errors
+  forward . /etc/resolv.conf
+  cache 30
+  reload
+  loadbalance round_robin
+}
+import custom/*.server       # <-- your .server keys are injected here
+```
+
+<Warning>
+Be careful when overriding `log`, `forward`, or `cache` plugins — these can cause increased load, unexpected query routing, or stale DNS records. Applying an incompatible configuration will break DNS. To recover, delete the contents of `coredns-custom` and the default configuration will be restored.
+</Warning>
+
+Gardener configures the CoreDNS `reload` plugin, so most ConfigMap changes are picked up within 30 seconds without a restart. To force an immediate reload:
+
+```bash
+kubectl -n kube-system rollout restart deploy coredns
+```
+
+## Kubernetes Service Host Injection
+
+Gardener can inject the `KUBERNETES_SERVICE_HOST` environment variable into pods to ensure they use the correct API server address. This is particularly useful for clusters with NodeLocal DNS or custom network topologies. This is managed automatically by Gardener and does not require end-user configuration.

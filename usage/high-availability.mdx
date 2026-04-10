@@ -1,0 +1,304 @@
+---
+title: High Availability for Shoot Control Planes
+description: Configure failure tolerance for Shoot control planes, understand zone and node spread, etcd replication, and best practices for tolerating zone outages.
+---
+
+Gardener supports highly available (HA) Shoot control planes that can tolerate infrastructure failures at the node or availability zone level. When HA is enabled, Gardener automatically provisions a multi-member etcd cluster, distributes control plane components across failure domains, and selects a compatible seed cluster.
+
+## Failure Tolerance Types
+
+A Shoot's control plane can operate in one of three modes:
+
+<CardGroup cols={3}>
+  <Card title="Non-HA (default)" icon="server">
+    Control plane pods are scheduled best-effort. There is no redundancy — a single node failure may cause temporary downtime while pods are rescheduled.
+  </Card>
+  <Card title="node failure tolerance" icon="circle-nodes">
+    Control plane components are spread across **different nodes within a single availability zone**. A multi-member etcd (quorum 3) is provisioned with each member on a different node. Worker pools should have at least 3 nodes.
+  </Card>
+  <Card title="zone failure tolerance" icon="globe">
+    Control plane components are spread across **different availability zones**. At least one replica per zone. Multi-member etcd (quorum 3) with each member in a different zone. Requires the seed cluster to have at least 3 zones.
+  </Card>
+</CardGroup>
+
+## Configuring High Availability
+
+Set the failure tolerance type in the Shoot spec:
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Shoot
+spec:
+  controlPlane:
+    highAvailability:
+      failureTolerance:
+        type: zone  # valid values: node | zone
+```
+
+For `zone` failure tolerance, the Gardener scheduler automatically selects a seed cluster with at least 3 availability zones.
+
+<Note>
+There will be a brief downtime when upgrading a non-HA control plane to HA — etcd transitions from a single-node to a multi-node cluster during this upgrade.
+</Note>
+
+### Allowed and Disallowed Transitions
+
+| Transition | Supported? |
+|---|---|
+| Non-HA → `node` failure tolerance | Yes |
+| Non-HA → `zone` failure tolerance | Yes (seed must be multi-zonal) |
+| `node` → `zone` failure tolerance | No (existing volumes are zone-bound) |
+| `zone` → `node` failure tolerance | No (same reason) |
+| HA → Non-HA (either type) | No (etcd-druid does not support scale-down) |
+
+## Worker Pools for High Availability
+
+For your control plane HA to be meaningful, your worker nodes should also be spread across multiple zones:
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Shoot
+spec:
+  provider:
+    workers:
+    - name: cpu-worker
+      minimum: 6
+      maximum: 60
+      maxSurge: 3
+      maxUnavailable: 0
+      zones:
+      - europe-central-1a
+      - europe-central-1b
+      - europe-central-1c
+```
+
+<Note>
+Gardener divides `minimum`, `maximum`, `maxSurge`, and `maxUnavailable` evenly across the listed zones. A pool with `minimum: 6` across 3 zones results in `minimum: 2` per zone's `MachineDeployment`. Plan your values with this division in mind.
+</Note>
+
+### Capacity Planning Across Zones
+
+When one zone fails, the remaining zones must absorb its workload. Factor this into your sizing:
+
+- With **2 zones**: surviving zone must handle +100% load.
+- With **3 zones**: each surviving zone must handle +50% load.
+- For consensus-based software (like etcd): use at least 3 zones to maintain quorum when one zone fails.
+
+## Cluster Autoscaler Configuration for HA
+
+Configure the cluster autoscaler to work effectively during zone outages:
+
+```yaml
+spec:
+  kubernetes:
+    clusterAutoscaler:
+      expander: "least-waste"  # Prefer filling existing node groups before adding new ones
+      scanInterval: 10s
+      scaleDownDelayAfterAdd: 60m
+      scaleDownDelayAfterDelete: 0s
+      scaleDownDelayAfterFailure: 3m
+      scaleDownUnneededTime: 30m
+      scaleDownUtilizationThreshold: 0.5
+```
+
+<Tip>
+Consider configuring [priority-based expanders](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/expander/priority/readme.md) and fallback worker pools with different machine types to handle zone outages gracefully:
+
+```yaml
+spec:
+  provider:
+    workers:
+    - name: primary-pool
+      priority: 60   # Preferred pool
+      machine:
+        type: m5.large
+    - name: fallback-pool
+      priority: 10   # Used when primary is unavailable
+      machine:
+        type: m5.xlarge
+```
+</Tip>
+
+## Kubelet Resource Configuration
+
+Tune kubelet resource reservations to maintain node stability under increased load during zone outages:
+
+```yaml
+spec:
+  kubernetes:
+    kubelet:
+      kubeReserved:
+        cpu: 100m
+        memory: 1Gi
+        ephemeralStorage: 1Gi
+        pid: 1000
+      evictionSoft:
+        memoryAvailable: 200Mi
+        imageFSAvailable: 10%
+        nodeFSAvailable: 10%
+      evictionSoftGracePeriod:
+        memoryAvailable: 1m30s
+        imageFSAvailable: 1m30s
+        nodeFSAvailable: 1m30s
+      evictionHard:
+        memoryAvailable: 100Mi
+        imageFSAvailable: 5%
+        nodeFSAvailable: 5%
+      evictionMaxPodGracePeriod: 90
+      evictionPressureTransitionPeriod: 5m0s
+```
+
+These settings can also be overridden per worker pool using `.spec.provider.workers[].kubernetes.kubelet`.
+
+## Key API Server and Controller Manager Settings
+
+```yaml
+spec:
+  kubernetes:
+    kubeAPIServer:
+      defaultNotReadyTolerationSeconds: 300
+      defaultUnreachableTolerationSeconds: 300
+    kubeControllerManager:
+      nodeMonitorGracePeriod: 40s
+      horizontalPodAutoscaler:
+        syncPeriod: 15s
+        tolerance: 0.1
+        downscaleStabilization: 5m0s
+        initialReadinessDelay: 30s
+        cpuInitializationPeriod: 5m0s
+```
+
+`defaultUnreachableTolerationSeconds` and `defaultNotReadyTolerationSeconds` control how quickly pods are evicted from unreachable or not-ready nodes. Lower values speed up recovery but increase the risk of unnecessary disruptions.
+
+## Workload Best Practices for Zone Tolerance
+
+### Pod Disruption Budgets
+
+Always define PodDisruptionBudgets for your workloads to control voluntary disruptions during rolling updates and scale-down:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+<Warning>
+Do not set `maxUnavailable: 0`. This blocks all voluntary disruptions, including helpful operations like patching or scaling, without providing any additional HA guarantee.
+</Warning>
+
+### Pod Topology Spread Constraints
+
+Distribute replicas across zones to prevent a single zone failure from taking down all instances:
+
+```yaml
+spec:
+  topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: my-app
+    minDomains: 3  # Require at least 3 zones before co-locating replicas
+```
+
+### Vertical Pod Autoscaler
+
+Enable VPA to ensure pods have sufficient resources, especially when load shifts due to a zone failure:
+
+```yaml
+spec:
+  kubernetes:
+    verticalPodAutoscaler:
+      enabled: true
+      evictAfterOOMThreshold: 10m0s
+      evictionRateBurst: 1
+      evictionRateLimit: -1
+      evictionTolerance: 0.5
+      recommendationMarginFraction: 0.15
+      updaterInterval: 1m0s
+      recommenderInterval: 1m0s
+```
+
+## CoreDNS Autoscaling for HA
+
+DNS is critical during zone outages when load patterns shift. Use cluster-proportional autoscaling to maintain DNS capacity:
+
+```yaml
+spec:
+  systemComponents:
+    coreDNS:
+      autoscaling:
+        mode: horizontal  # horizontal (CPU-based) | cluster-proportional (node/core-based)
+```
+
+## Handling Zone Outages During Active Reconciliation
+
+During a zone outage, Gardener's reconciliation flow may stall because all etcd replicas cannot become ready simultaneously. As a last resort, you can skip readiness checks:
+
+```bash
+kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+  shoot.gardener.cloud/skip-readiness=true
+```
+
+<Warning>
+The `shoot.gardener.cloud/skip-readiness` annotation is a last resort for stuck reconciliation during active zone outages. Using it together with Kubernetes upgrades or credential rotation may cause a severe outage of your Shoot control plane. Consult your Gardener landscape administrator before using it.
+</Warning>
+
+## Complete HA Reference Configuration
+
+The following is a consolidated reference for production HA cluster settings:
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Shoot
+spec:
+  controlPlane:
+    highAvailability:
+      failureTolerance:
+        type: zone
+  kubernetes:
+    kubeAPIServer:
+      defaultNotReadyTolerationSeconds: 300
+      defaultUnreachableTolerationSeconds: 300
+    kubeControllerManager:
+      nodeMonitorGracePeriod: 40s
+      horizontalPodAutoscaler:
+        syncPeriod: 15s
+        tolerance: 0.1
+        downscaleStabilization: 5m0s
+    verticalPodAutoscaler:
+      enabled: true
+      evictAfterOOMThreshold: 10m0s
+      evictionTolerance: 0.5
+      recommendationMarginFraction: 0.15
+    clusterAutoscaler:
+      expander: "least-waste"
+      scanInterval: 10s
+      scaleDownDelayAfterAdd: 60m
+      scaleDownUnneededTime: 30m
+      scaleDownUtilizationThreshold: 0.5
+  provider:
+    workers:
+    - name: cpu-worker
+      minimum: 6
+      maximum: 60
+      maxSurge: 3
+      maxUnavailable: 0
+      zones:
+      - europe-central-1a
+      - europe-central-1b
+      - europe-central-1c
+      machineControllerManager:
+        machineCreationTimeout: 20m
+        machineHealthTimeout: 10m
+        machineDrainTimeout: 60h
+  systemComponents:
+    coreDNS:
+      autoscaling:
+        mode: horizontal
+```

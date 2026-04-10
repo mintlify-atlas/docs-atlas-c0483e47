@@ -1,0 +1,120 @@
+---
+title: "Gardener API Reference: All API Groups Overview"
+description: "Overview of Gardener API groups, versioning, authentication, and how to access the aggregated API server using kubectl and kubeconfig."
+---
+
+Gardener exposes its resources through a Kubernetes-style API served by the Gardener API server. This API server runs as an aggregated extension of the garden cluster's kube-apiserver, meaning all Gardener resource types are accessible through the same kubeconfig you use for the garden cluster. You interact with Gardener resources using standard Kubernetes tooling such as `kubectl`, client libraries, or direct HTTP calls.
+
+## Accessing the API
+
+You need a kubeconfig pointing to the garden cluster. Once you have one, all standard `kubectl` operations work against Gardener resources:
+
+```bash
+# List all Shoots across all namespaces
+kubectl get shoots --all-namespaces
+
+# List Seeds
+kubectl get seeds
+
+# List Projects
+kubectl get projects
+
+# Describe a specific Shoot
+kubectl describe shoot my-shoot -n garden-dev
+
+# Get all available API resources registered in the garden cluster
+kubectl api-resources --api-group=core.gardener.cloud
+kubectl api-resources --api-group=seedmanagement.gardener.cloud
+kubectl api-resources --api-group=extensions.gardener.cloud
+kubectl api-resources --api-group=security.gardener.cloud
+kubectl api-resources --api-group=operations.gardener.cloud
+```
+
+<Note>
+  The Gardener API server is registered as an APIService in the garden cluster. All traffic to `*.gardener.cloud` API groups is forwarded to the Gardener API server. Your kubeconfig does not need to point directly at the Gardener API server — the standard garden cluster API endpoint handles routing automatically.
+</Note>
+
+## Aggregated API server
+
+Gardener's API server is implemented as a Kubernetes aggregated API server. It registers `APIService` objects for each API group and version, instructing the kube-apiserver to proxy requests for those groups to the Gardener API server pod. This means:
+
+- Authentication and authorization are handled by the garden cluster's kube-apiserver.
+- You can use RBAC rules in the garden cluster to control access to Gardener resources.
+- `kubectl` and all standard Kubernetes clients work without modification.
+
+## Authentication
+
+Gardener uses the garden cluster's authentication mechanisms. Typically this means:
+
+- **Certificate-based**: A kubeconfig with a client certificate and key.
+- **Token-based**: A bearer token (ServiceAccount token or OIDC token).
+- **OIDC**: If the garden cluster is configured with an OIDC provider, you can use identity provider tokens.
+
+```bash
+# Check your current context and credentials
+kubectl config current-context
+kubectl auth can-i list shoots -n garden-dev
+```
+
+## API versioning
+
+Gardener follows Kubernetes API versioning conventions:
+
+| Stage | Version | Meaning |
+|---|---|---|
+| Alpha | `v1alpha1` | May change or be removed without notice |
+| Beta | `v1beta1` | Reasonably stable, may have minor incompatibilities |
+| Stable | `v1` | Fully stable, backward-compatible |
+
+Most Gardener core resources are at `v1beta1`. Extension and operational resources use `v1alpha1`.
+
+## API groups
+
+<CardGroup cols={2}>
+  <Card title="core.gardener.cloud" icon="server" href="/api-reference/core">
+    The primary API group. Contains Shoot, Seed, CloudProfile, Project, SecretBinding, CredentialsBinding, BackupBucket, BackupEntry, and more. Version: v1beta1.
+  </Card>
+  <Card title="seedmanagement.gardener.cloud" icon="seedling" href="/api-reference/seedmanagement">
+    Manages the lifecycle of gardenlets and seeds. Contains Gardenlet, ManagedSeed, and ManagedSeedSet. Version: v1alpha1.
+  </Card>
+  <Card title="extensions.gardener.cloud" icon="puzzle-piece" href="/api-reference/extensions">
+    Resources used by provider and network extensions internally. Contains Infrastructure, Worker, ControlPlane, Network, OperatingSystemConfig, DNSRecord, Bastion, and more. Version: v1alpha1.
+  </Card>
+  <Card title="security.gardener.cloud" icon="shield" href="/api-reference/security">
+    Security-related resources. Contains CredentialsBinding (the successor to SecretBinding) and WorkloadIdentity for extension authentication. Version: v1alpha1.
+  </Card>
+  <Card title="operations.gardener.cloud" icon="terminal" href="/api-reference/operations">
+    Operational resources for cluster management. Contains Bastion for SSH access to shoot nodes. Version: v1alpha1.
+  </Card>
+  <Card title="resources.gardener.cloud" icon="box" href="/concepts/resource-manager">
+    Manages Kubernetes resources deployed into shoot or seed clusters via ManagedResource objects. Version: v1alpha1.
+  </Card>
+  <Card title="operator.gardener.cloud" icon="wrench" href="/concepts/operator">
+    Resources for managing the garden environment. Contains Garden (virtual garden cluster) and Extension (extension registration). Version: v1alpha1.
+  </Card>
+</CardGroup>
+
+## Discovering API versions
+
+```bash
+# List all API groups and versions available in the garden cluster
+kubectl api-versions | grep gardener
+
+# Get the API resource list for a specific group/version
+kubectl get --raw /apis/core.gardener.cloud/v1beta1 | python3 -m json.tool
+
+# Get OpenAPI schema for a specific resource
+kubectl explain shoot
+kubectl explain shoot.spec
+kubectl explain shoot.spec.provider
+```
+
+<Tip>
+  Use `kubectl explain` to explore the full field documentation for any Gardener resource type directly from the API server. This is the most up-to-date reference since it reads the OpenAPI schema served by the running API server.
+</Tip>
+
+## API reference documentation
+
+The detailed API reference for each group is available in the pages linked from the cards above. Each page covers the resource types, their spec fields, and status conditions.
+
+For the raw generated API reference (in HTML format), see the `docs/api-reference/` directory in the Gardener repository, which contains one Markdown file per API group.

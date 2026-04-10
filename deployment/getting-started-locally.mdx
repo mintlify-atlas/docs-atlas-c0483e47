@@ -1,0 +1,335 @@
+---
+title: "Deploying and Running Gardener on Your Local Machine"
+description: "Step-by-step guide to running a full Gardener development environment locally using KinD, Skaffold, and the local provider extension."
+---
+
+This guide walks you through deploying Gardener on your local machine using [KinD](https://kind.sigs.k8s.io/) (Kubernetes in Docker). A single KinD cluster acts as both the garden and seed cluster, giving you a complete Gardener environment without any cloud provider credentials.
+
+All container images are built and deployed using [Skaffold](https://skaffold.dev/) via their [Helm charts](https://helm.sh/).
+
+<Note>
+If you encounter difficulties with this guide, please open a GitHub issue so the process can be improved.
+</Note>
+
+## Alternatives to local setup
+
+When deploying locally, you may face resource or networking constraints:
+
+- Your machine may not have enough compute for a second seed cluster or multiple shoot clusters
+- Testing IPv6 features requires a Linux machine with native IPv6 internet connectivity
+
+If you hit these limits, consider:
+- [Remote local setup](#remote-local-setup) — run the same KinD-based setup inside a remote Kubernetes pod
+- [Dev box on Google Cloud](https://github.com/gardener-community/dev-box-gcp) — a Google Cloud machine for more resources and dual-stack networking
+
+## Prerequisites
+
+Before starting, ensure you have:
+
+- Completed the [Local Setup guide](https://github.com/gardener/gardener/blob/master/docs/development/local_setup.md) through the "Get the sources" step
+- Docker daemon running with at least **8 CPUs** and **8Gi memory** allocated
+- At least **120Gi** of disk space configured for Docker
+
+<Warning>
+8 CPU / 8Gi memory supports up to about two Shoot clusters. Increase these values if you need more. For a second seed cluster, allocate at least 10 CPUs and 18Gi memory.
+</Warning>
+
+You can check and reclaim Docker disk space with:
+
+```bash
+docker system df
+docker system prune -a
+```
+
+## Setting up the environment
+
+<Steps>
+  <Step title="Start the KinD cluster">
+    Run the following command to create a KinD cluster named `gardener-local`:
+
+    ```bash
+    make kind-up
+    ```
+
+    For an IPv6 cluster:
+
+    ```bash
+    make kind-up IPFAMILY=ipv6
+    ```
+
+    This command:
+    - Creates the `gardener-local` KinD cluster
+    - Stores the kubeconfig at `./example/gardener-local/kind/local/kubeconfig`
+    - Deploys a local container registry accessible at `localhost:5001` and `registry.local.gardener.cloud:5001`
+    - Sets up registry mirrors as pull-through caches for all upstream registries Gardener uses
+    - Installs [Calico](https://github.com/projectcalico/calico) as the CNI (replacing the default `kindnet`, which lacks `NetworkPolicy` support)
+    - Deploys [metrics-server](https://github.com/kubernetes-sigs/metrics-server) to support HPA and VPA
+
+    Registry mirrors store pulled images under `dev/local-registry` on the host, so images persist across cluster recreations.
+  </Step>
+
+  <Step title="Configure your kubeconfig">
+    Point your kubeconfig at the new cluster for all subsequent steps:
+
+    ```bash
+    export KUBECONFIG=$PWD/example/gardener-local/kind/local/kubeconfig
+    ```
+
+    Optionally copy it to your default kubeconfig location:
+
+    ```bash
+    cp ./example/gardener-local/kind/local/kubeconfig $HOME/.kube/config
+    ```
+  </Step>
+
+  <Step title="(Optional) Configure the local registry as insecure">
+    If Docker does not connect to the local registry, add it to your insecure registries in `/etc/docker/daemon.json`:
+
+    ```json
+    { "insecure-registries": ["registry.local.gardener.cloud:5001"] }
+    ```
+  </Step>
+
+  <Step title="Deploy Gardener">
+    Build the component images and deploy Gardener into the cluster:
+
+    ```bash
+    make gardener-up
+    ```
+
+    For an IPv6-ready Gardener:
+
+    ```bash
+    make operator-seed-up IPFAMILY=ipv6
+    ```
+
+    The first run builds base images, which takes a few minutes. Subsequent runs are faster due to layer caching.
+  </Step>
+
+  <Step title="Wait for the seed to be ready">
+    Wait for the local seed to report readiness:
+
+    ```bash
+    ./hack/usage/wait-for.sh seed local GardenletReady SeedSystemComponentsHealthy ExtensionsReady
+    ```
+
+    Or poll manually:
+
+    ```bash
+    kubectl get seed local
+    ```
+
+    Expected output when ready:
+
+    ```bash
+    NAME    STATUS   PROVIDER   REGION   AGE     VERSION       K8S VERSION
+    local   Ready    local      local    4m42s   vX.Y.Z-dev    v1.28.1
+    ```
+  </Step>
+
+  <Step title="Create a Shoot cluster">
+    Apply the example Shoot manifest:
+
+    ```bash
+    kubectl apply -f example/provider-local/shoot.yaml
+    ```
+
+    For a workerless Shoot:
+
+    ```bash
+    kubectl apply -f example/provider-local/shoot-workerless.yaml
+    ```
+
+    Wait for the Shoot to be ready:
+
+    ```bash
+    NAMESPACE=garden-local ./hack/usage/wait-for.sh shoot local APIServerAvailable ControlPlaneHealthy ObservabilityComponentsHealthy EveryNodeReady SystemComponentsHealthy
+    ```
+
+    Or poll manually:
+
+    ```bash
+    kubectl -n garden-local get shoot local
+    ```
+
+    The `LAST OPERATION` column reaches `100%` when the cluster is fully provisioned:
+
+    ```bash
+    NAME    CLOUDPROFILE   PROVIDER   REGION   K8S VERSION   HIBERNATION   LAST OPERATION            STATUS    AGE
+    local   local          local      local    1.28.1        Awake         Create Processing (43%)   healthy   94s
+    ```
+  </Step>
+
+  <Step title="Access the Shoot cluster">
+    Acquire a kubeconfig for the Shoot cluster using the helper script:
+
+    ```bash
+    ./hack/usage/generate-kubeconfig.sh > admin-kubeconf.yaml
+    ```
+
+    For a viewer kubeconfig instead:
+
+    ```bash
+    ./hack/usage/generate-kubeconfig.sh --viewer > viewer-kubeconf.yaml
+    ```
+
+    To specify a different namespace or shoot name:
+
+    ```bash
+    ./hack/usage/generate-kubeconfig.sh --namespace <namespace> --shoot-name <shootname> > admin-kubeconf.yaml
+    ```
+
+    To access an Ingress resource from the seed, use the Ingress host with port `8448`:
+    `https://<ingress-host>:8448`
+
+    <Warning>
+    A VPN running on your local machine may interfere with the Shoot cluster connection. If you see connection errors, try disabling the VPN first.
+    </Warning>
+  </Step>
+</Steps>
+
+## Developing Gardener
+
+To run Gardener with a live reload development loop:
+
+```bash
+make gardener-dev
+```
+
+After the initial deployment, Skaffold watches source files. Press any key to trigger a new build and deployment when changes are detected.
+
+Use `SKAFFOLD_MODULE` to limit which components Skaffold watches, significantly reducing turnaround time:
+
+```bash
+# Deploy all components first
+make gardener-up
+# Then iterate on gardenlet only
+make gardener-dev SKAFFOLD_MODULE=gardenlet
+```
+
+## Debugging Gardener
+
+```bash
+make gardener-debug
+```
+
+This uses Skaffold's debug mode with [Delve](https://github.com/go-delve/delve) for Go debugging. Leader election, health checks, and readiness probes are automatically disabled for debugged components to prevent pod restarts during breakpoints.
+
+The default Delve port is `56268`. When debugging multiple components simultaneously, subsequent ports increment from there.
+
+<Tabs>
+  <Tab title="GoLand">
+    1. Open **Run/Debug Configurations**
+    2. Add a new **Go Remote** configuration
+    3. Set the port to `56268` (or any increment for multiple components)
+    4. Set **On disconnect** behavior to **Leave it running** (recommended)
+  </Tab>
+  <Tab title="VS Code">
+    Add the following to `.vscode/launch.json`:
+
+    ```json
+    {
+      "name": "go remote",
+      "type": "go",
+      "request": "attach",
+      "mode": "remote",
+      "port": 56268,
+      "host": "127.0.0.1"
+    }
+    ```
+
+    The `cwd` and `remotePath` options are not needed because the [ko](https://skaffold.dev/docs/builders/builder-types/ko/) builder Skaffold uses matches the workspace folder automatically.
+  </Tab>
+</Tabs>
+
+<Note>
+Pausing a goroutine at a breakpoint pauses all goroutines in the process. This means gardenlet (or any other debugged component) cannot renew its lease or respond to probes while paused. Skaffold automatically increases probe timeouts to 600 seconds to compensate.
+</Note>
+
+## Optional: Setting up a second seed cluster
+
+A second seed is useful for testing [control plane migration](https://github.com/gardener/gardener/blob/master/docs/operations/control_plane_migration.md).
+
+```bash
+# Create the second KinD cluster
+make kind2-up
+
+# Deploy gardenlet and required resources into it
+make gardenlet-kind2-up
+```
+
+The second cluster is named `gardener-local2` with its kubeconfig at `./example/gardener-local/kind/local2/kubeconfig`.
+
+Wait for the second seed:
+
+```bash
+./hack/usage/wait-for.sh seed local2 GardenletReady SeedSystemComponentsHealthy ExtensionsReady
+```
+
+## Alternative: Using gardener-operator
+
+Instead of `make kind-up gardener-up`, you can use `gardener-operator` to manage your local landscape:
+
+```bash
+make kind-multi-zone-up operator-up
+```
+
+Then create the Garden and install gardenlet:
+
+```bash
+make operator-seed-up
+```
+
+Kubeconfigs are available at:
+- Runtime cluster: `./dev-setup/kubeconfigs/runtime/kubeconfig`
+- Virtual garden: `./dev-setup/kubeconfigs/virtual-garden/kubeconfig`
+
+For a development loop in this mode:
+
+```bash
+make operator-seed-dev
+```
+
+<Info>
+In the operator-based setup, Skaffold only watches `gardenlet`, `gardenlet/chart`, `gardener-resource-manager`, and `gardener-node-agent`. The debugging setup is not yet supported in this mode.
+</Info>
+
+## Remote local setup
+
+You can run the KinD-based setup inside a remote Kubernetes pod — the same way Prow runs KinD-based e2e tests:
+
+```bash
+kubectl apply -f docs/deployment/content/remote-local-setup.yaml
+kubectl exec -it remote-local-setup-0 -- sh
+tmux a
+```
+
+To access Plutono, Prometheus, or other components from a browser, set up two port-forwards: one from your laptop to the pod, and one from inside the pod to the component:
+
+```bash
+# On your laptop
+kubectl port-forward remote-local-setup-0 3000
+
+# Inside the pod
+kubectl port-forward -n shoot--local--local deployment/plutono 3000
+```
+
+## Tearing down
+
+Delete the Shoot cluster before tearing down the environment:
+
+```bash
+./hack/usage/delete shoot local garden-local
+```
+
+Then tear down the full environment:
+
+```bash
+make kind-down
+```
+
+For the second seed only:
+
+```bash
+make kind2-down
+```

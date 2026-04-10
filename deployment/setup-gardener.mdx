@@ -1,0 +1,305 @@
+---
+title: "How to Set Up a Gardener Landscape"
+description: "Step-by-step guide covering runtime cluster prerequisites, DNS zones, certificates, backup buckets, operator deployment, and seed registration."
+---
+
+A Gardener landscape is built on top of an existing Kubernetes cluster — the *runtime* cluster — which hosts all Gardener control plane components. Within that cluster, Gardener bootstraps a second, nodeless *virtual Garden* cluster that serves as the management plane for all `Shoot`, `Seed`, and related resources. Getting a landscape running requires assembling several building blocks in the right order: deploying the Gardener Operator, creating the `Garden` resource, registering at least one seed, and configuring extensions for each cloud provider you want to support.
+
+<Note>
+This guide uses OpenStack as the infrastructure provider, Garden Linux as the operating system, and Calico as the CNI. These choices are illustrative. A single Gardener landscape can support multiple providers simultaneously by deploying additional provider-extensions.
+</Note>
+
+## Target Architecture
+
+```
+Runtime Cluster
+└── garden namespace
+    ├── gardener-operator
+    ├── Virtual Garden (kube-apiserver, etcd, gardener-apiserver, …)
+    └── gardenlet  →  registers runtime cluster as Seed #1
+                          └── Hosts control planes of "infrastructure" Shoots
+                                  └── ManagedSeeds → host user Shoot control planes
+```
+
+The runtime cluster serves two purposes in a minimal setup: it hosts the virtual Garden cluster and, through a deployed `gardenlet`, registers itself as the first seed. For larger production setups it is strongly recommended to deploy the `gardenlet` on a separate cluster.
+
+## Prerequisites
+
+<AccordionGroup>
+  <Accordion title="Runtime Cluster">
+    An already-running Kubernetes cluster is required. It hosts the virtual Garden's `kube-apiserver`, `etcd`, admission webhooks, and `gardener-controller-manager`. Verify the cluster meets the supported Kubernetes version requirements before proceeding.
+
+    Reference: [Gardener Architecture](../concepts/architecture.md)
+  </Accordion>
+
+  <Accordion title="DNS Zone">
+    The virtual Garden API endpoint is exposed through an Istio `Gateway` backed by a `LoadBalancer` `Service`. A DNS zone where an `A` record can be created is required. Gardener also advertises `kube-apiservers` of `Shoot` clusters through DNS, which requires at least one additional zone with credentials for automation.
+
+    Assuming a base domain of `crazy-botany.gardener.cloud`, a typical DNS structure looks like:
+
+    | Component | Pattern | Example |
+    |---|---|---|
+    | Gardener Base | `gardener.<base-domain>` | `gardener.crazy-botany.gardener.cloud` |
+    | Virtual Garden | `api.garden.<base-domain>` | `api.garden.gardener.crazy-botany.gardener.cloud` |
+    | Gardener Ingress | `ingress.garden.<base-domain>` | `ingress.garden.gardener.crazy-botany.gardener.cloud` |
+    | Gardener Dashboard | `dashboard.ingress.<base-domain>` | `dashboard.ingress.garden.crazy-botany.gardener.cloud` |
+    | Shoot Internal | `internal.<base-domain>` | `internal.gardener.crazy-botany.gardener.cloud` |
+    | Shoot External (default) | `shoot.<base-domain>` | `shoot.gardener.crazy-botany.gardener.cloud` |
+    | Unmanaged Seed Ingress | `ingress.soil.<base-domain>` | `ingress.soil.gardener.crazy-botany.gardener.cloud` |
+    | Managed Seed | `<name>.seed.<base-domain>` | `cc-ha.seed.gardener.crazy-botany.gardener.cloud` |
+  </Accordion>
+
+  <Accordion title="Certificates">
+    Several Gardener components require TLS certificates signed by a trusted CA. Using an ACME service is strongly recommended over manual certificate management. The [Gardener extension for certificate services](https://github.com/gardener/gardener-extension-shoot-cert-service) automates creation and renewal of certificates for the entire landscape.
+  </Accordion>
+
+  <Accordion title="Backup Bucket">
+    The virtual Garden cluster's `etcd` is managed by [etcd-druid](https://github.com/gardener/etcd-druid). When configured, continuous backups are stored to a supported object store. Provider credentials for the object store must be available. This is **strongly recommended** for any production installation.
+  </Accordion>
+
+  <Accordion title="Infrastructure Provider Access">
+    For each cloud provider you want to support, the corresponding provider-extension must be deployed. Access credentials for the infrastructure — in the provider-specific format (e.g., OpenStack application credentials) — must be provided to Gardener.
+  </Accordion>
+</AccordionGroup>
+
+## Deployment Steps
+
+<Steps>
+  <Step title="Deploy the Gardener Operator">
+    The Gardener Operator is published as a Helm chart and as an OCI artifact attached to every release of `gardener/gardener`. Install it into the `garden` namespace of your runtime cluster:
+
+    ```bash
+    helm template ./charts/gardener/operator \
+      --namespace garden \
+      --set replicaCount=2 \
+      --set image.tag=v1.125.0
+    ```
+
+    The operator reconciles `Garden` resources and manages the lifecycle of all Gardener control plane components. Reference: [Gardener Operator concepts](../concepts/operator.md)
+  </Step>
+
+  <Step title="Deploy Provider Extensions">
+    Extensions provide support for infrastructure providers, operating systems, and network plugins. Every Gardener installation needs at minimum:
+
+    - One **infrastructure provider** extension (e.g., provider-openstack)
+    - One **operating system** extension (Garden Linux is recommended)
+    - One **network plugin** (CNI) extension (e.g., Calico)
+    - Shoot service extensions (DNS service, cert service, OIDC service)
+
+    Extensions are described by `Extension` resources (`operator.gardener.cloud/v1alpha1`) deployed to the runtime cluster. The Gardener Operator takes care of deploying the required resources to both the runtime and the virtual Garden cluster.
+
+    The following example deploys the OpenStack provider extension, which supports `BackupBucket`, `DNSRecord`, and several other resource types:
+
+    ```yaml
+    apiVersion: operator.gardener.cloud/v1alpha1
+    kind: Extension
+    metadata:
+      name: provider-openstack
+    spec:
+      deployment:
+        admission:
+          runtimeCluster:
+            helm:
+              ociRepository:
+                repository: europe-docker.pkg.dev/gardener-project/releases/charts/gardener/extensions/admission-openstack-runtime
+                tag: v1.44.1
+          values:
+            replicaCount: 3
+          virtualCluster:
+            helm:
+              ociRepository:
+                repository: europe-docker.pkg.dev/gardener-project/releases/charts/gardener/extensions/admission-openstack-application
+                tag: v1.44.1
+        extension:
+          helm:
+            ociRepository:
+              repository: europe-docker.pkg.dev/gardener-project/releases/charts/gardener/extensions/provider-openstack
+              tag: v1.44.1
+          values:
+            replicaCount: 3
+            resources:
+              requests:
+                cpu: 30m
+                memory: 256Mi
+          injectGardenKubeconfig: true
+      resources:
+      - kind: BackupBucket
+        type: openstack
+      - kind: DNSRecord
+        type: openstack-designate
+    ```
+
+    If your OCI registry uses a custom CA certificate or requires authentication, reference a CA bundle secret and a pull secret:
+
+    ```yaml
+    helm:
+      ociRepository:
+        repository: registry.example.com
+        tag: v1.44.1
+        caBundleSecretRef:
+          name: my-ca-bundle
+        pullSecretRef:
+          name: my-pull-secret
+    ```
+  </Step>
+
+  <Step title="Create the Garden Resource">
+    The `Garden` resource configures the entire landscape: domain names, CIDR blocks for the virtual cluster, high availability settings, backup storage, and DNS providers. Create it in the runtime cluster after the operator is running.
+
+    Configure the DNS provider for automated DNS record management:
+
+    ```yaml
+    dns:
+      providers:
+      - name: primary
+        type: openstack-designate
+        secretRef:
+          name: dns-showroom-garden
+    ```
+
+    To use the cert-service extension for automated TLS certificates for the Garden runtime cluster, add to the `Garden` resource's `spec.extensions`:
+
+    ```yaml
+    spec:
+      extensions:
+      - type: controlplane-cert-service
+        providerConfig:
+          apiVersion: service.cert.extensions.gardener.cloud/v1alpha1
+          kind: CertConfig
+          generateControlPlaneCertificate: true
+    ```
+
+    On the first reconciliation, the operator bootstraps `etcd-main`, `etcd-events`, `gardener-apiserver`, `gardener-scheduler`, and `gardener-controller-manager` in the `garden` namespace. Wait for the `Garden` resource to reach `Succeeded` state:
+
+    ```bash
+    kubectl get garden crazy-botany
+
+    NAME           K8S VERSION   GARDENER VERSION   LAST OPERATION   RUNTIME   VIRTUAL   API SERVER   OBSERVABILITY   AGE
+    crazy-botany   1.31.1        v1.110.0           Succeeded        True      True      True         True            1d
+    ```
+
+    <Note>
+    If automatic DNS record creation is not supported for your environment, manually create an `A` record pointing to the external IP of the `istio-ingressgateway` service in the `virtual-garden-istio-ingress` namespace.
+    </Note>
+  </Step>
+
+  <Step title="Configure CloudProfiles">
+    Before any `Shoot` can be created, at least one `CloudProfile` must be deployed to the virtual Garden cluster. A `CloudProfile` describes supported Kubernetes versions, machine images, machine types, and infrastructure regions.
+
+    Steps to build a `CloudProfile`:
+    1. Add at least one supported Kubernetes minor version to `.spec.kubernetes.versions[]`
+    2. Add at least one region and availability zone to `.spec.regions[]`
+    3. Add at least one machine image with a supported version to `.spec.machineImages[]`
+    4. Add one or more machine types to `.spec.machineTypes[]`
+    5. Provide a `.spec.providerConfig` according to the extension's documentation
+
+    ```yaml
+    apiVersion: core.gardener.cloud/v1beta1
+    kind: CloudProfile
+    metadata:
+      name: openstack-example
+    spec:
+      kubernetes:
+        versions:
+        - classification: supported
+          expirationDate: "2025-07-30T23:59:59Z"
+          version: 1.31.2
+      machineImages:
+      - name: gardenlinux
+        updateStrategy: minor
+        versions:
+        - architectures:
+          - amd64
+          - arm64
+          classification: supported
+          version: 1592.3.0
+      machineTypes:
+      - architecture: amd64
+        cpu: "2"
+        gpu: "0"
+        memory: 4Gi
+        name: small_machine
+        usable: true
+      regions:
+      - name: my-region-1
+        zones:
+        - name: my-region-1a
+        - name: my-region-1b
+      providerConfig:
+        apiVersion: openstack.provider.extensions.gardener.cloud/v1alpha1
+        kind: CloudProfileConfig
+        machineImages:
+        - name: gardenlinux
+          versions:
+          - version: 1592.3.0
+            regions:
+            - id: abcd-1234
+              name: my-region-1
+    ```
+  </Step>
+
+  <Step title="Set Up DNS for Internal and External Domains">
+    Gardener maintains DNS records for every `Shoot` cluster. Credentials for the DNS zones must be deployed as `Secret`s to the virtual Garden cluster.
+
+    <Warning>
+    The preferred way to configure domain settings is through the `Seed` API directly: internal domains via `.spec.dns.internal` and default domains via `.spec.dns.defaults`. See the [Seed resource example](https://github.com/gardener/gardener/blob/master/example/50-seed.yaml).
+    </Warning>
+
+    It is forbidden to change the internal domain secret while there are existing shoot clusters — plan this carefully during initial setup.
+  </Step>
+
+  <Step title="Deploy the First Gardenlet">
+    At least one `Seed` is required before any `Shoot` can be created. The first seed is registered by deploying a `gardenlet`. The easiest approach is to create a `Gardenlet` resource in the virtual Garden cluster:
+
+    ```yaml
+    spec:
+      config:
+        seedConfig:
+          spec:
+            taints:
+              - key: seed.gardener.cloud/protected
+            settings:
+              scheduling:
+                visible: false
+    ```
+
+    The `seed.gardener.cloud/protected` taint reserves this first seed for infrastructure `Shoot`s only — not for user `Shoot` clusters. This is a common pattern that allows the landscape to scale properly through `ManagedSeed` resources.
+
+    See the [Deploy Gardenlets](./deploy-gardenlet) guide for all deployment options and detailed configuration.
+  </Step>
+
+  <Step title="Create Infrastructure Shoots and ManagedSeeds">
+    With the first seed in place, create a `Shoot` cluster using infrastructure credentials (`Secret` + `CredentialsBinding`). The `Shoot` must tolerate the protected seed taint:
+
+    ```yaml
+    spec:
+      tolerations:
+      - key: seed.gardener.cloud/protected
+    ```
+
+    Once the `Shoot` is running, register it as a seed using a `ManagedSeed` resource in the virtual Garden cluster. These Gardener-managed seeds then host the control planes of user `Shoot` clusters, allowing the landscape to scale independently of the unmanaged runtime infrastructure.
+  </Step>
+</Steps>
+
+## Extension Summary
+
+<CardGroup cols={2}>
+  <Card title="Infrastructure Provider" icon="cloud">
+    Required. Implements `BackupBucket`, `DNSRecord`, `Infrastructure`, `Worker`, and other resources for a specific cloud. Example: `gardener-extension-provider-openstack`.
+  </Card>
+  <Card title="Operating System" icon="server">
+    Required. Provides OS images for shoot worker nodes. Garden Linux is the recommended choice and publishes images alongside release notes.
+  </Card>
+  <Card title="Network Plugin (CNI)" icon="network-wired">
+    Required. Implements networking for shoot clusters. Calico and Cilium are commonly used options.
+  </Card>
+  <Card title="Shoot Services" icon="wrench">
+    Optional but recommended. DNS service, cert service, and OIDC service extend functionality for shoot clusters without requiring custom code.
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+- [Deploy Gardenlets](./deploy-gardenlet) — detailed instructions for all three gardenlet deployment methods
+- [Seed Settings](../operations/seed-settings) — configure per-seed behavior like excess capacity reservation and VPA
+- [Feature Gates](./feature-gates) — enable or disable experimental Gardener features

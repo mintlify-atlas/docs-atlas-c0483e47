@@ -1,0 +1,139 @@
+---
+title: "Gardener Node Agent: Worker Node Lifecycle"
+description: "How gardener-node-agent bootstraps worker nodes, reconciles OperatingSystemConfig, manages the kubelet, and replaces legacy cloud-config bash scripts."
+---
+
+The `gardener-node-agent` is a Kubernetes controller that runs directly on worker nodes. Its primary purpose is to bootstrap a machine into a fully functional worker node and then maintain the node-specific components that run outside of Kubernetes — principally the `kubelet` systemd service, its configuration, and other systemd units managed by Gardener.
+
+This component replaces the former `cloud-config-downloader` and `cloud-config-executor` scripts, which were written in bash and suffered from polling delays, lack of testability, and limited validation. The `gardener-node-agent` brings the same controller-based patterns used throughout Gardener to node lifecycle management.
+
+## Architecture
+
+The flow begins with an `OperatingSystemConfig` (OSC) resource and a corresponding worker-pool-specific `cloud-config-<worker-pool>` secret. The `machine-controller-manager` passes a reference to this secret via the machine's user data at provisioning time.
+
+On the node, a small init script — `gardener-node-init.sh` — is placed at `/var/lib/gardener-node-agent/init.sh` via cloud-init. This script's sole responsibility is downloading the `gardener-node-agent` binary from an OCI artifact and placing it at `/opt/bin/gardener-node-agent`.
+
+Along with the init script, a configuration file is written to `/var/lib/gardener-node-agent/config.yaml` containing:
+- The shoot's `kube-apiserver` endpoint and certificates
+- Controller configuration
+
+Once running, the `gardener-node-agent` sets itself up as a systemd service and begins watching the `cloud-config` secret in the shoot cluster's `kube-system` namespace.
+
+## Installation and bootstrapping
+
+<Steps>
+  <Step title="Machine provisioning">
+    The `machine-controller-manager` provisions a new machine and passes the init script and configuration via cloud-init user data.
+  </Step>
+  <Step title="Init script execution">
+    The `gardener-node-init.sh` script runs on first boot, downloads the `gardener-node-agent` binary from the configured OCI artifact, and starts it.
+  </Step>
+  <Step title="Systemd service setup">
+    The `gardener-node-agent` registers itself as a systemd service and performs pre-installation tasks (e.g., formatting the data device for the kubelet).
+  </Step>
+  <Step title="OperatingSystemConfig reconciliation">
+    The agent watches the `cloud-config` secret in `kube-system`, decodes the `OperatingSystemConfig`, and applies all specified files and systemd units — including the kubelet binary, its configuration file, and the `kubelet.service` unit.
+  </Step>
+  <Step title="Kubelet starts">
+    With the kubelet installed and configured, it registers the node with the shoot cluster's API server. The node becomes `Ready` after all critical components pass health checks.
+  </Step>
+</Steps>
+
+## Controllers
+
+### OperatingSystemConfig controller
+
+This is the core controller. It watches `Secret`s in the `kube-system` namespace of the shoot cluster whose `data` map contains an `OperatingSystemConfig`. The OSC specifies all systemd units and files required for node configuration.
+
+On each reconciliation, the controller:
+
+1. Decodes the OSC and computes which files and units have changed since the last reconciliation.
+2. Writes or updates changed files to the filesystem. File content can be provided inline, via an image reference, or via a `secretRef` pointing to another secret.
+3. Removes files and units no longer present in the OSC.
+4. Reloads the systemd daemon and starts or stops units accordingly.
+5. Persists the applied OSC to disk for future diff computation.
+
+After successful reconciliation, the controller updates two annotations on the `Node` object:
+
+- `worker.gardener.cloud/kubernetes-version`: The installed kubelet version.
+- `checksum/cloud-config-data`: The checksum of the applied OSC, used to determine whether a node is up-to-date.
+
+#### Static pod reconciliation
+
+After applying the OSC, the controller also reconciles static pods defined in `/etc/kubernetes/manifests/`. It:
+
+1. Scans the OSC for files in `/etc/kubernetes/manifests/` containing pod definitions.
+2. Extracts the expected configuration hash from the `gardener.cloud/config.mirror` annotation on each static pod manifest.
+3. Compares with currently running static pods (labeled `static-pod=true`).
+4. Waits for the kubelet to pick up new manifests if hashes don't match yet.
+5. Verifies that all static pods are healthy before marking reconciliation complete.
+
+#### Serial reconciliation
+
+For nodes that must never be updated in parallel — such as control plane nodes in self-hosted shoot clusters running etcd — the controller supports a serial reconciliation mode.
+
+Enable it by annotating the OSC secret with `reconciliation.osc.node-agent.gardener.cloud/serial=true`. When enabled, only one `gardener-node-agent` instance at a time reconciles the OSC using a Kubernetes `Lease`-based leader election:
+
+1. Each instance attempts to acquire a `Lease` named after the secret in `kube-system`.
+2. The instance holding the lease runs reconciliation (lease duration: 10 minutes, renewed at start).
+3. After successful reconciliation, the instance releases the lease.
+4. Other instances waiting for the lease are notified via a watch and proceed in turn.
+
+<Note>
+Serial reconciliation is particularly important for etcd's quorum requirement. Updating multiple etcd nodes simultaneously risks losing quorum and making the cluster unavailable. The kube-apiserver can tolerate temporary replica unavailability behind a load balancer, but etcd cannot.
+</Note>
+
+### Token controller
+
+This controller watches access token secrets in `kube-system` configured in `.controllers.token.syncConfigs[]`. Whenever the `.data.token` field changes, it writes the new token to the configured path on the host filesystem. This ensures the `gardener-node-agent` and other systemd components (like `valitail`) always use the most current token without requiring a restart. The underlying `client-go` library dynamically reloads the token from the file.
+
+### Certificate controller
+
+This controller monitors the expiration of the client certificate used by `gardener-node-agent` to authenticate with the shoot cluster's API server. It requests a new certificate before the current one expires, ensuring uninterrupted API access.
+
+### Lease controller
+
+Each `gardener-node-agent` instance creates and renews a `Lease` object in the `kube-system` namespace of the shoot cluster every 10 seconds. This serves as a heartbeat indicating the node agent is running on the corresponding node.
+
+### Node controller
+
+This controller watches the `Node` object for the machine it runs on (identified by hostname via the `kubernetes.io/hostname` label). When the `worker.gardener.cloud/restart-systemd-services` annotation changes, the controller restarts the specified systemd units and removes the annotation. This mechanism allows operators to remotely trigger systemd service restarts.
+
+### Health check controller
+
+This controller periodically checks the health of critical node components — specifically `containerd` and `kubelet`. If a health check fails, the controller restarts the affected systemd service to restore normal operation.
+
+### Hostname check controller
+
+This controller periodically verifies that the machine's hostname has not changed. If a hostname change is detected, it triggers a restart of the `gardener-node-agent` itself by calling its cancel function.
+
+### Systemd unit check controller
+
+This controller periodically checks the health of all systemd units managed by the `gardener-node-agent`. It reports a `SystemdUnitsReady` condition on the `Node` object. Units are considered unhealthy when:
+
+- A unit is in `failed` state.
+- A unit has been stuck in `activating` or `deactivating` for longer than a configurable threshold (default: 5 minutes).
+- An enabled unit is `inactive`.
+- An enabled unit is not loaded.
+
+The gardenlet's shoot care controller incorporates the `SystemdUnitsReady` condition into the overall `EveryNodeReady` shoot condition.
+
+## Why the node agent improves on the previous approach
+
+<AccordionGroup>
+  <Accordion title="Improved speed">
+    The former `cloud-config-downloader` polled the API server every 60 seconds in a loop. The `gardener-node-agent` uses Kubernetes watch semantics: changes to the OSC secret, node object, or access token trigger immediate reconciliation. This reduces the worst-case lag from 60 seconds to near-instant and significantly cuts API server load on large clusters.
+  </Accordion>
+  <Accordion title="Selective restarts">
+    The old implementation restarted all systemd units on every OSC change, causing unnecessary kubelet restarts. The `gardener-node-agent` diffs the new and previous OSC, restarting only the units that actually changed.
+  </Accordion>
+  <Accordion title="Type-safe configuration">
+    Previously, each configuration item was a separate file on disk, parsed with shell variable assignment. The `gardener-node-agent` uses a typed YAML API stored in a single file, enabling validation, comparison, and detection of removed files and units.
+  </Accordion>
+  <Accordion title="Developer productivity">
+    Business logic written in Go is easier to test, maintain, and extend than equivalent bash scripts. The transition from bash to a Go controller removes almost all remaining bash from the critical node bootstrapping path.
+  </Accordion>
+  <Accordion title="Scalability">
+    A jitter mechanism distributes reconciliation delays across nodes, preventing thundering-herd behavior on the API server when many nodes need to apply the same update simultaneously. The `gardener-resource-manager`'s Node Agent Reconciliation Delay Controller computes per-node delays using a linear mapping based on node index.
+  </Accordion>
+</AccordionGroup>

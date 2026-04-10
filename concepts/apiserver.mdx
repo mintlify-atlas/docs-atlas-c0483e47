@@ -1,0 +1,161 @@
+---
+title: "Gardener API Server: Aggregated API Extension"
+description: "How gardener-apiserver extends Kubernetes via API aggregation, which API groups it exposes, and the admission plugins that enforce validation logic."
+---
+
+The Gardener API server is a Kubernetes-native extension built on the [aggregation layer](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/apiserver-aggregation/). It registers itself via an `APIService` object and runs inside the garden cluster, extending the Kubernetes API with Gardener-specific resource groups. Unlike a separate API server, it is fully integrated with Kubernetes authentication, authorization, and admission machinery.
+
+This design means that `kubectl`, RBAC policies, audit logging, and custom admission webhooks all work with Gardener resources exactly as they do with core Kubernetes resources.
+
+## API groups
+
+The `gardener-apiserver` exposes resources across several API groups:
+
+<CardGroup cols={2}>
+  <Card title="core.gardener.cloud" icon="database">
+    Primary API group containing Shoots, Seeds, CloudProfiles, Projects, SecretBindings, BackupBuckets, BackupEntries, and more.
+  </Card>
+  <Card title="seedmanagement.gardener.cloud" icon="sprout">
+    Contains ManagedSeed and Gardenlet resources for managing seed cluster lifecycle.
+  </Card>
+  <Card title="operations.gardener.cloud" icon="wrench">
+    Contains operational resources like Bastion for SSH access to shoot nodes.
+  </Card>
+  <Card title="security.gardener.cloud" icon="shield">
+    Contains WorkloadIdentity and CredentialsBinding for trust-based authentication.
+  </Card>
+  <Card title="settings.gardener.cloud" icon="sliders">
+    Contains ClusterOpenIDConnectPreset and OpenIDConnectPreset resources.
+  </Card>
+</CardGroup>
+
+## Core resources
+
+### CloudProfiles
+
+`CloudProfile`s describe a specific infrastructure environment (AWS, Azure, GCP, etc.) and contain operator-defined constraints: available machine types, regions, supported Kubernetes versions, and operating system images. End-users can read `CloudProfile`s to discover available options, but only operators can create or modify them. On every shoot create or update, an admission plugin validates that the shoot only uses values permitted by the referenced `CloudProfile`.
+
+```yaml
+# CloudProfiles also accept an optional providerConfig for provider-specific constraints
+spec:
+  providerConfig:
+    apiVersion: aws.provider.extensions.gardener.cloud/v1alpha1
+    kind: CloudProfileConfig
+    # ...
+```
+
+### NamespacedCloudProfiles
+
+`NamespacedCloudProfile`s let project administrators create project-scoped customizations of parent `CloudProfile`s — for example, overriding expiration dates for Kubernetes versions or machine images. These customizations are visible only within the project.
+
+### InternalSecrets
+
+`InternalSecret`s store shoot or project-related secrets that are managed by Gardener itself, separate from user-accessible `Secret`s. They behave like standard Kubernetes `Secret`s but are exposed as a dedicated API resource, allowing access control to be separated via RBAC.
+
+Gardener uses `InternalSecret`s to sync each shoot's client CA to the project namespace (named `<shoot-name>.ca-client`). The `shoots/adminkubeconfig` subresource uses this CA to sign short-lived admin credentials.
+
+<Note>
+Operators should configure `gardener-apiserver` to encrypt `internalsecrets.core.gardener.cloud` resources at rest in etcd.
+</Note>
+
+### Seeds
+
+`Seed` resources represent seed clusters. Gardener does not manage how seeds are created — the only requirement is Kubernetes v1.31 or later, passing the Kubernetes conformance tests. Operators register seeds either by deploying a gardenlet (recommended, which creates the `Seed` object after bootstrapping) or by creating the `Seed` resource directly with a kubeconfig secret reference.
+
+### Shoot Quotas
+
+`Quota` resources let operators register shared infrastructure accounts with limits on resource consumption. Trial clusters under a quota are automatically terminated after a configured time period, with the option for end-users to extend the lifetime manually.
+
+### Projects
+
+`Project`s group shoot clusters together and provide a namespace in the garden cluster for all related resources. Project members can be granted `admin` or `viewer` roles. When a project is created, the API server provisions a dedicated namespace prefixed with `garden-`.
+
+### SecretBindings
+
+`SecretBinding`s bind infrastructure provider credential secrets to a project namespace, making them referenceable by shoot clusters. Shoots reference a `SecretBinding` to specify which cloud provider account to use.
+
+### Shoots
+
+`Shoot` resources are the primary user-facing resource in Gardener. They specify the desired state of an end-user Kubernetes cluster including Kubernetes version, worker pool configuration, networking, and provider-specific settings. Provider-specific configuration (for infrastructure, control plane, worker pools) is not evaluated by Gardener itself but forwarded to the appropriate extension controller.
+
+<Warning>
+Provider-specific configuration errors cannot be caught at request time (unless a validator webhook is registered). They will only surface during reconciliation by the extension controller.
+</Warning>
+
+### OpenIDConnectPresets
+
+`ClusterOpenIDConnectPreset` and `OpenIDConnectPreset` resources allow operators to automatically inject OIDC configuration into new shoot clusters. See the [Security documentation](/usage/security) for details on OIDC presets.
+
+## Admission plugins
+
+The `gardener-apiserver` includes a set of in-tree admission plugins similar to those in `kube-apiserver`. All plugins listed below are enabled by default unless noted otherwise.
+
+<AccordionGroup>
+  <Accordion title="Shoot-related plugins">
+    **`ShootValidator`** (Validating): Validates `CREATE`, `UPDATE`, and `DELETE` operations against the referenced `CloudProfile` — checking machine images, machine types, Kubernetes versions, and other dynamic constraints.
+
+    **`ShootMutator`** (Mutating): Sets the `gardener.cloud/created-by` annotation, maintains lifecycle annotations (`shoot.gardener.cloud/tasks`), defaults networking fields from the seed's `shootDefaults`, and defaults Kubernetes and machine image versions.
+
+    **`ShootDNS`** (Validating + Mutating): Assigns a default domain to new shoots and validates DNS configuration.
+
+    **`ShootQuotaValidator`** (Validating): Checks that the resource consumption declared in the shoot spec does not exceed applicable `Quota` resources referenced by the `SecretBinding`.
+
+    **`ShootResourceReservation`** (Mutating): Injects `kubelet.kubeReserved` settings for each worker pool. Supports a GKE-style formula based on machine type when `useGKEFormula: true` is configured.
+
+    **`ShootTolerationRestriction`** (Validating + Mutating): Validates and defaults `.spec.tolerations` against the project's and global whitelist.
+
+    **`ShootVPAEnabledByDefault`** (Mutating): Sets `spec.kubernetes.verticalPodAutoscaler.enabled=true` on new shoots unless explicitly disabled.
+
+    **`DeletionConfirmation`** (Validating + Mutating): Requires the `confirmation.gardener.cloud/deletion=true` annotation before allowing deletion of `Project`s, `Shoot`s, and `ShootState`s. Implements the optional four-eyes deletion principle for projects.
+
+    **`ShootManagedSeed`** (Validating): Blocks deleting a shoot that is registered as a seed via a `ManagedSeed`. Validates managed-seed-specific configuration (nginx addon disabled, VPA enabled).
+
+    **`ShootDNSRewriting`** (Mutating, disabled by default): Adds common DNS suffix rewriting configuration to new shoots for DNS search path optimization.
+
+    **`ShootNodeLocalDNSEnabledByDefault`** (Mutating, disabled by default): Enables node-local DNS for new shoots by setting `spec.systemComponents.nodeLocalDNS.enabled=true`.
+
+    **`ShootExposureClass`** (Mutating): Merges `shootSelectors` and `tolerations` from a referenced `ExposureClass` into the shoot.
+  </Accordion>
+  <Accordion title="Seed and infrastructure plugins">
+    **`SeedValidator`** (Validating): Blocks seed deletion while shoots are still scheduled on it. Prevents removal of zones from `seed.spec.provider.zones` while the seed is in use.
+
+    **`SeedMutator`** (Mutating): Maintains `name.seed.gardener.cloud/<name>=true` labels on `Seed` resources, including parent seed name labels for managed seeds.
+
+    **`ExtensionValidator`** (Validating): Validates that extension types referenced in `BackupBucket`s, `BackupEntry`s, `Seed`s, and `Shoot`s have a corresponding `ControllerRegistration`.
+
+    **`ExtensionLabels`** (Mutating): Adds `<extension-type>.extensions.gardener.cloud/<extension-name>=true` labels to resources, enabling extension admission webhooks to filter only relevant resources.
+
+    **`ControllerRegistrationResources`** (Validating): Enforces that only one `ControllerRegistration` is primarily responsible for any given kind/type combination.
+
+    **`BackupBucketValidator`** (Validating): Validates that `BackupBucket`s using `WorkloadIdentity` credentials have the same provider type as the `WorkloadIdentity`.
+  </Accordion>
+  <Accordion title="Project and access control plugins">
+    **`ProjectMutator`** (Mutating): Sets `.spec.createdBy` on new projects and ensures the project owner is always in the members list.
+
+    **`CustomVerbAuthorizer`** (Validating): Enforces custom RBAC verbs — for example, only users with the `modify-spec-tolerations-whitelist` verb can change a project's toleration whitelist. The `mark-self-hosted` verb is required to configure self-hosted shoot control planes.
+
+    **`ResourceReferenceManager`** (Validating): Verifies that resources referenced in specifications (secrets, cloud profiles, etc.) actually exist. Also prevents removing Kubernetes or machine image versions from a `CloudProfile` while shoots still reference them.
+
+    **`FinalizerRemoval`** (Validating): Prevents users from removing the `gardener` finalizer from `Shoot`s, `SecretBinding`s, and `CredentialsBinding`s while they are still in use.
+
+    **`ResourceQuota`** (Validating): Enables object count `ResourceQuota`s for Gardener resources like `Shoot`s, `SecretBinding`s, and `Project`s.
+  </Accordion>
+  <Accordion title="ManagedSeed plugins">
+    **`ManagedSeed`** (Validating + Mutating): Validates and defaults configuration values for `ManagedSeed`s — such as seed provider, network ranges, and DNS domain — against the referenced shoot.
+
+    **`ManagedSeedShoot`** (Validating): Prevents deleting a `ManagedSeed` while shoots are scheduled on the seed it registers.
+  </Accordion>
+  <Accordion title="OIDC preset plugins">
+    **`ClusterOpenIDConnectPreset`** and **`OpenIDConnectPreset`** (Mutating): On new shoot creation without OIDC configuration, these plugins find matching presets by weight and inject OIDC configuration automatically.
+  </Accordion>
+</AccordionGroup>
+
+## How it differs from kube-apiserver
+
+The `gardener-apiserver` is an *aggregated* API server, not a replacement for the Kubernetes API server. It runs alongside `kube-apiserver` in the garden (or virtual garden) cluster. The key differences are:
+
+- It manages Gardener-specific resources, not core Kubernetes resources.
+- It reuses the same etcd as the virtual garden's `kube-apiserver`, simplifying backup and restore.
+- It has its own set of in-tree admission plugins tailored to Gardener's domain model.
+- It validates provider-specific configuration at a higher semantic level than static CRD validation allows.
+- It enforces deletion confirmation requirements to prevent accidental destruction of running clusters.

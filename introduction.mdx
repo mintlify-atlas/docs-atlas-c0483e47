@@ -1,0 +1,122 @@
+---
+title: "Introduction to Gardener: Kubernetes Clusters as a Service"
+description: "Gardener automates the management and operation of Kubernetes clusters across any cloud or infrastructure provider using a Kubernetes-native architecture."
+---
+
+Gardener implements the automated management and operation of Kubernetes clusters as a service. It provides a fully validated extensibility framework that can be adjusted to any programmatic cloud or infrastructure provider, delivering homogeneous clusters with exactly the same bill of material, configuration, and behavior on all supported infrastructures.
+
+Gardener is 100% Kubernetes-native and exposes its own Cluster API to create consistent clusters across AWS, Azure, GCP, OpenStack, Alibaba Cloud, and more. Rather than harmonizing only how to provision clusters, Gardener's API also standardizes the make-up of the clusters themselves — meaning your clusters look and behave the same regardless of the underlying provider.
+
+## The Kubernetes-in-Kubernetes architecture
+
+Gardener's main principle is to leverage Kubernetes concepts for all of its tasks. To accomplish this, Gardener introduces new API objects in an existing Kubernetes cluster — called the **garden** cluster — to manage end-user Kubernetes clusters, called **shoot** clusters.
+
+The key insight is that shoot cluster control planes (etcd, API server, controller manager, scheduler) are not hosted on dedicated master VMs. Instead, they run as native Kubernetes workloads inside **seed** clusters. This architecture is commonly called "kubeception" or the inception design.
+
+This approach:
+- Reduces total cost of ownership by eliminating dedicated master VMs
+- Makes day-2 operations (cluster updates, HA) simpler by relying on standard Kubernetes features
+- Enables control planes to be deployed with a replica count of 1 by default, scaled out only under pressure
+
+## The three cluster types
+
+<CardGroup cols={3}>
+  <Card title="Garden cluster" icon="seedling">
+    The central management cluster. Hosts the Gardener API server, controller manager, and scheduler. Contains all Shoot custom resources describing desired end-user clusters.
+  </Card>
+  <Card title="Seed cluster" icon="server">
+    Infrastructure clusters (one per IaaS provider and region) that host the control planes of multiple Shoot clusters as regular Kubernetes workloads.
+  </Card>
+  <Card title="Shoot cluster" icon="leaf">
+    End-user Kubernetes clusters. Consist only of worker nodes — the control plane lives in the seed. Users get full administrative access.
+  </Card>
+</CardGroup>
+
+## Mapping Kubernetes to Gardener
+
+Gardener reuses the identical Kubernetes design to span a scalable multi-cloud and multi-cluster landscape. The analogy maps directly:
+
+| Kubernetes concept | Gardener equivalent |
+|--------------------|---------------------|
+| `kube-apiserver` | `gardener-apiserver` |
+| Controller Manager | Gardener Controller Manager |
+| Scheduler | Gardener Scheduler |
+| `kubelet` | `gardenlet` |
+| Node | Seed cluster |
+| Pod | Shoot cluster |
+
+Just as the kubelet runs on each node to manage pods, the **gardenlet** runs in each seed cluster to manage the shoot clusters whose control planes are hosted there. This design means Gardener scales naturally: adding capacity is a matter of registering another seed cluster.
+
+## Key components
+
+**Gardener API Server** — An extension API server (using Kubernetes API aggregation) that introduces `Shoot`, `Seed`, `CloudProfile`, and other custom resources into the garden cluster.
+
+**Gardener Controller Manager** — Watches the custom resources and acts upon them: creating, reconciling, updating, and deleting shoot clusters in response to declarative specifications.
+
+**Gardener Scheduler** — Assigns shoot clusters to appropriate seed clusters based on configurable scheduling strategies.
+
+**Gardenlet** — The per-seed agent responsible for reconciling shoot clusters hosted in its seed. It bootstraps itself into a seed cluster and registers the seed with the garden cluster.
+
+**Gardener Dashboard** — A central operator UI that communicates with the garden cluster, providing a web interface for managing shoots, seeds, projects, and members.
+
+## A Shoot cluster in practice
+
+Shoot clusters are described via declarative specifications. Here is an example showing the core structure of a `Shoot` resource:
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Shoot
+metadata:
+  name: crazy-botany
+  namespace: garden-dev
+spec:
+  credentialsBindingName: my-provider-account
+  cloudProfile:
+    name: cloudprofile1
+  region: europe-central-1
+  purpose: evaluation
+  provider:
+    type: aws
+    workers:
+    - name: cpu-worker
+      minimum: 3
+      maximum: 5
+      machine:
+        type: m5.large
+      volume:
+        type: gp2
+        size: 20Gi
+  kubernetes:
+    dns:
+      domain: crazy-botany.core.my-custom-domain.com
+  networking:
+    type: calico
+    ipFamilies:
+    - IPv4
+    pods: 100.96.0.0/11
+    nodes: 10.250.0.0/16
+    services: 100.64.0.0/13
+  maintenance:
+    timeWindow:
+      begin: 220000+0100
+      end: 230000+0100
+    autoUpdate:
+      kubernetesVersion: true
+      machineImageVersion: true
+```
+
+Gardener controllers watch these resources and reconcile the actual state of the cluster to match the desired spec — bringing up clusters, rolling updates, and ensuring they remain healthy.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture overview" icon="diagram-project" href="/concepts/architecture">
+    Understand how garden, seed, and shoot clusters interact, and how control planes are hosted.
+  </Card>
+  <Card title="Getting started locally" icon="laptop" href="/deployment/getting-started-locally">
+    Run Gardener on your local machine using KinD in minutes.
+  </Card>
+  <Card title="Getting started remotely" icon="cloud" href="/deployment/getting-started-remotely">
+    Deploy Gardener against a real cloud provider like AWS, Azure, or GCP.
+  </Card>
+</CardGroup>

@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Gardener",
+  "projectType": "infrastructure",
+  "projectName": "Gardener",
+  "projectDescription": "Gardener automates the management and operation of homogeneous Kubernetes clusters at scale across any infrastructure using hosted control planes and a Kubernetes-native extensibility framework.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#76ccb4",
-    "light": "#05906b",
-    "dark": "#d2e5d4"
-  },
-  "favicon": "https://media.brand.dev/b9eddfc4-5f45-4de0-a1e0-8f1b2f724364.svg",
-  "logo": {
-    "light": "https://media.brand.dev/a7584774-87ce-451f-876a-bffabe5cd791.svg",
-    "dark": "https://media.brand.dev/a7584774-87ce-451f-876a-bffabe5cd791.svg"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/gardener/gardener"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/gardener/gardener"
-    }
-  },
+  "primaryColor": "#76ccb4",
+  "lightColor": "#05906b",
+  "darkColor": "#d2e5d4",
   "navigation": {
     "tabs": [
       {
@@ -104,5 +87,29 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Kubernetes-native cluster management using hosted control planes (k8s-in-k8s pattern)",
+    "Multi-cloud and multi-infrastructure support via an extensible provider model",
+    "Automated cluster lifecycle management including creation, upgrades, and deletion",
+    "Homogeneous clusters with identical configuration across all supported infrastructures",
+    "Gardenlet agent for decentralized seed cluster management and reversed control flow",
+    "Gardener Operator for self-hosted garden environment management",
+    "High-availability shoot cluster control planes with automated failover",
+    "Extensible architecture supporting custom providers, DNS, networking, and OS configs",
+    "Kubernetes conformance certified across major cloud providers",
+    "Built-in monitoring, logging, backup/restore, and etcd management"
+  ],
+  "publicApiSurface": [
+    "core.gardener.cloud/v1beta1: Shoot, Seed, CloudProfile, Project, SecretBinding, BackupBucket, BackupEntry",
+    "seedmanagement.gardener.cloud/v1alpha1: Gardenlet, ManagedSeed",
+    "extensions.gardener.cloud/v1alpha1: Infrastructure, Worker, ControlPlane, Network, OperatingSystemConfig, DNSRecord, Bastion",
+    "security.gardener.cloud/v1alpha1: CredentialsBinding, WorkloadIdentity",
+    "operator.gardener.cloud/v1alpha1: Garden, Extension",
+    "resources.gardener.cloud/v1alpha1: ManagedResource",
+    "operations.gardener.cloud/v1alpha1: Bastion",
+    "gardenadm CLI: init, join, token, status",
+    "Gardenlet TLS bootstrapping and seed registration API",
+    "Extension registration via ControllerRegistration and ControllerDeployment resources"
+  ]
 }

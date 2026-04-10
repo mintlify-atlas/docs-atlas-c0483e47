@@ -1,0 +1,394 @@
+---
+title: "Deploying Gardenlets to Seed Clusters"
+description: "Three methods to deploy gardenlets — manually via Helm, automatically via gardener-operator, or through ManagedSeed — with TLS bootstrapping details."
+---
+
+Gardenlets are the decentralized agents that manage shoot clusters on behalf of a seed cluster. Each seed cluster must have a running gardenlet that communicates with the Gardener API server in the virtual Garden cluster. There are three distinct deployment methods depending on your setup: manual Helm chart installation, deployment via `gardener-operator`, or automatic propagation through `ManagedSeed` resources. Choosing the right method depends on whether `gardener-operator` manages your Garden cluster and whether the target cluster is network-reachable from the operator.
+
+## Choosing a Deployment Method
+
+<CardGroup cols={3}>
+  <Card title="Manual (Helm)" icon="hammer">
+    For clusters behind a firewall or managed by third-party tooling. Requires direct network access to the seed cluster during initial setup.
+  </Card>
+  <Card title="Via gardener-operator" icon="wand-magic-sparkles">
+    Recommended when `gardener-operator` manages the Garden cluster. The operator handles initial deployment; gardenlet self-upgrades thereafter.
+  </Card>
+  <Card title="Automatic (ManagedSeed)" icon="arrows-rotate">
+    For adding more seed clusters once an initial seed exists. The existing gardenlet deploys itself into shoot clusters to create managed seeds.
+  </Card>
+</CardGroup>
+
+<Tip>
+Once you have one manually deployed gardenlet, all subsequent seeds can be added automatically using the `ManagedSeed` approach. The manually deployed gardenlet acts as the bootstrap for the entire landscape.
+</Tip>
+
+---
+
+## Method 1: Deploy a Gardenlet Manually
+
+Manual deployment is required when the target cluster is not reachable by `gardener-operator` — for example, when the cluster sits behind a firewall or is managed by external tooling. The gardenlet Helm chart must be installed directly.
+
+### TLS Bootstrapping
+
+The gardenlet needs to communicate with the Gardener API server in the Garden cluster. It uses a TLS bootstrapping process similar to Kubelet TLS bootstrapping. The bootstrap flow works as follows:
+
+1. A short-lived bootstrap token is created in the Garden cluster
+2. The gardenlet uses the token to request a signed certificate via a CSR
+3. After approval, the gardenlet stores its long-lived `kubeconfig` in a secret
+
+### Step 1: Create a Bootstrap Token Secret
+
+Create a bootstrap token secret in the `kube-system` namespace of the **Garden** cluster:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bootstrap-token-07401b
+  namespace: kube-system
+type: bootstrap.kubernetes.io/token
+stringData:
+  description: "Token to be used by the gardenlet for Seed `sweet-seed`."
+  token-id: 07401b        # 6 characters
+  token-secret: f395accd246ae52d  # 16 characters
+  usage-bootstrap-authentication: "true"
+  usage-bootstrap-signing: "true"
+```
+
+<Note>
+The Garden cluster's `kube-apiserver` must have [bootstrap token authentication](https://kubernetes.io/docs/reference/access-authn-authz/bootstrap-tokens/#enabling-bootstrap-token-authentication) enabled. Client credentials for the bootstrap process must be `token` or `certificate` type — OIDC is not supported.
+</Note>
+
+### Step 2: Prepare the Bootstrap Kubeconfig
+
+Construct a bootstrap `kubeconfig` using the token (`token-id.token-secret`):
+
+```yaml
+apiVersion: v1
+kind: Config
+current-context: gardenlet-bootstrap@default
+clusters:
+- cluster:
+    certificate-authority-data: <ca-of-garden-cluster>
+    server: https://<endpoint-of-garden-cluster>
+  name: default
+contexts:
+- context:
+    cluster: default
+    user: gardenlet-bootstrap
+  name: gardenlet-bootstrap@default
+users:
+- name: gardenlet-bootstrap
+  user:
+    token: 07401b.f395accd246ae52d
+```
+
+### Step 3: Configure gardenlet Values
+
+Create a `gardenlet-values.yaml` referencing the bootstrap kubeconfig:
+
+```yaml
+config:
+  gardenClientConnection:
+    bootstrapKubeconfig:
+      name: gardenlet-kubeconfig-bootstrap
+      namespace: garden
+      kubeconfig: |
+        <bootstrap-kubeconfig-content>  # will be base64 encoded by Helm
+    kubeconfigSecret:
+      name: gardenlet-kubeconfig
+      namespace: garden
+  seedConfig:
+    metadata:
+      name: sweet-seed
+      labels:
+        environment: evaluation
+    spec:
+      dns:
+        provider:
+          type: aws-route53
+          credentialsRef:
+            apiVersion: v1
+            kind: Secret
+            name: ingress-secret
+            namespace: garden
+      ingress:
+        domain: ingress.dev.my-seed.example.com
+        controller:
+          kind: nginx
+      networks:
+        nodes: 10.240.0.0/16
+        pods: 100.244.0.0/16
+        services: 100.32.0.0/13
+        shootDefaults:
+          pods: 100.96.0.0/11
+          services: 100.64.0.0/13
+      provider:
+        region: eu-west-1
+        type: aws
+      backup:
+        provider: aws
+        credentialsRef:
+          apiVersion: v1
+          kind: Secret
+          name: sweet-seed-backup
+          namespace: garden
+```
+
+<Warning>
+Configure the CIDR blocks carefully to avoid overlapping ranges with the runtime cluster or other seeds. Overlapping CIDRs will cause connectivity issues for shoot clusters.
+</Warning>
+
+### Step 4: Deploy via Helm
+
+```bash
+helm install gardenlet charts/gardener/gardenlet \
+  --namespace garden \
+  -f gardenlet-values.yaml \
+  --wait
+```
+
+This creates: a `gardenlet` service account, RBAC roles, the bootstrap kubeconfig secret, and the gardenlet Deployment in the `garden` namespace.
+
+### Step 5: Verify Deployment
+
+After deployment, verify the TLS bootstrap was successful:
+
+```bash
+# Extract and verify the kubeconfig created during bootstrap
+kubectl -n garden get secret gardenlet-kubeconfig -o json \
+  | jq -r .data.kubeconfig | base64 -d
+
+# Check that the bootstrap secret has been cleaned up
+kubectl -n garden get secret gardenlet-bootstrap-kubeconfig  # should be gone
+
+# Check seed conditions
+kubectl get seed sweet-seed -o json | jq .status.conditions
+```
+
+A healthy seed shows conditions like:
+
+```json
+[
+  {
+    "message": "Gardenlet is posting ready status.",
+    "reason": "GardenletReady",
+    "status": "True",
+    "type": "GardenletReady"
+  },
+  {
+    "message": "Backup Buckets are available.",
+    "reason": "BackupBucketsAvailable",
+    "status": "True",
+    "type": "BackupBucketsReady"
+  }
+]
+```
+
+### Optional: High Availability Mode
+
+For seed clusters hosting HA shoot control planes, run multiple gardenlet replicas:
+
+```yaml
+replicaCount: 2
+failureToleranceType: zone  # or "node"
+```
+
+### Optional: Enable Self-Upgrades
+
+To avoid manually redeploying the Helm chart on every upgrade, configure gardenlet to self-upgrade by reading its desired configuration from a `Gardenlet` resource in the Garden cluster:
+
+```yaml
+selfUpgrade:
+  deployment:
+    helm:
+      ociRepository:
+        ref: <url-to-oci-repository-containing-gardenlet-helm-chart>
+```
+
+---
+
+## Method 2: Deploy via `gardener-operator`
+
+When `gardener-operator` manages the Garden cluster, it can deploy the initial gardenlet automatically. The operator only handles the first deployment; after that, gardenlet uses the self-upgrade mechanism.
+
+### Deploy to the Same Cluster
+
+To register the cluster where `gardener-operator` is running as a seed, create a `Gardenlet` resource in the virtual Garden cluster:
+
+```yaml
+apiVersion: seedmanagement.gardener.cloud/v1alpha1
+kind: Gardenlet
+metadata:
+  name: local
+  namespace: garden
+spec:
+  deployment:
+    replicaCount: 1
+    revisionHistoryLimit: 2
+    helm:
+      ociRepository:
+        ref: <url-to-gardenlet-chart-repository>:v1.97.0
+  config:
+    apiVersion: gardenlet.config.gardener.cloud/v1alpha1
+    kind: GardenletConfiguration
+    controllers:
+      shoot:
+        reconcileInMaintenanceOnly: true
+        respectSyncPeriodOverwrite: true
+    logging:
+      enabled: true
+    seedConfig:
+      apiVersion: core.gardener.cloud/v1beta1
+      kind: Seed
+      metadata:
+        labels:
+          base: kind
+      spec:
+        ingress:
+          controller:
+            kind: nginx
+          domain: ingress.local.seed.local.gardener.cloud
+        networks:
+          nodes: 172.18.0.0/24
+          pods: 10.1.0.0/16
+          services: 10.2.0.0/16
+          shootDefaults:
+            pods: 10.3.0.0/16
+            services: 10.4.0.0/16
+        provider:
+          region: local
+          type: local
+        settings:
+          scheduling:
+            visible: true
+          verticalPodAutoscaler:
+            enabled: true
+```
+
+### Deploy to a Remote Cluster
+
+To deploy gardenlet into a separate cluster, create a kubeconfig secret and reference it in the `Gardenlet` resource:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: remote-cluster-kubeconfig
+  namespace: garden
+type: Opaque
+data:
+  kubeconfig: <base64-encoded-kubeconfig>
+---
+apiVersion: seedmanagement.gardener.cloud/v1alpha1
+kind: Gardenlet
+metadata:
+  name: remote-seed
+  namespace: garden
+spec:
+  kubeconfigSecretRef:
+    name: remote-cluster-kubeconfig
+  # ... rest of config
+```
+
+<Warning>
+After `gardener-operator` successfully deploys gardenlet, it **deletes** the kubeconfig secret and sets `.spec.kubeconfigSecretRef` to `nil`. If you use GitOps tooling, update your repository to reflect this change — otherwise the operator will repeatedly try to re-reconcile a secret reference that no longer exists.
+</Warning>
+
+### Forceful Re-Deployment
+
+To force re-deployment of a gardenlet (e.g., after certificate expiry or an accidentally deleted Deployment), annotate the `Gardenlet` resource:
+
+```bash
+kubectl annotate gardenlet <name> -n garden \
+  gardener.cloud/operation=force-redeploy
+```
+
+The operator removes this annotation after completing the re-deployment.
+
+---
+
+## Method 3: Automatic Deployment via ManagedSeed
+
+Once an initial seed cluster exists, additional seed clusters (called "managed seeds" or "shooted seeds") can be added automatically. The existing gardenlet deploys itself into shoot clusters when `ManagedSeed` resources are created.
+
+This is the preferred method for scaling out a Gardener landscape because shoot clusters already provide production-grade infrastructure qualities that are also required for seeds.
+
+### Process
+
+1. Use the initial (unmanaged) seed to create shoot clusters
+2. Create `ManagedSeed` resources in the virtual Garden cluster pointing to these shoots
+3. The gardenlet in the initial seed automatically deploys itself into the target shoot clusters
+4. The shoot clusters become registered as new seed clusters
+
+Reference: [ManagedSeeds: Register Shoot as Seed](https://github.com/gardener/gardener/blob/master/docs/operations/managed_seed.md)
+
+---
+
+## Self-Upgrade Mechanism
+
+For unmanaged seeds (clusters not created as Shoots), keeping the gardenlet up-to-date traditionally required network access to re-run the Helm chart. The self-upgrade feature eliminates this requirement.
+
+Gardenlet watches for a `seedmanagement.gardener.cloud/v1alpha1.Gardenlet` resource in the `garden` namespace of the Garden cluster with the same name as its managed `Seed`. This resource contains the gardenlet's deployment configuration, including the OCI repository reference for its Helm chart.
+
+To trigger an upgrade, update the OCI reference tag:
+
+```yaml
+spec:
+  deployment:
+    helm:
+      ociRepository:
+        ref: <url-to-gardenlet-chart-repository>:v1.98.0
+```
+
+Gardenlet downloads the chart, renders it with the provided values, and applies it to its own cluster. No external network access to the seed cluster is needed.
+
+A full example `Gardenlet` resource with self-upgrade enabled:
+
+```yaml
+apiVersion: seedmanagement.gardener.cloud/v1alpha1
+kind: Gardenlet
+metadata:
+  name: sweet-seed
+  namespace: garden
+spec:
+  deployment:
+    replicaCount: 1
+    revisionHistoryLimit: 2
+    helm:
+      ociRepository:
+        ref: <url-to-gardenlet-chart-repository>:v1.97.0
+        caBundleSecretRef:
+          name: my-ca-bundle
+        pullSecretRef:
+          name: my-pull-secret
+  config:
+    apiVersion: gardenlet.config.gardener.cloud/v1alpha1
+    kind: GardenletConfiguration
+    gardenClientConnection:
+      kubeconfigSecret:
+        name: gardenlet-kubeconfig
+        namespace: garden
+    featureGates:
+      DefaultSeccompProfile: true
+    logging:
+      enabled: true
+      vali:
+        enabled: true
+    seedConfig:
+      apiVersion: core.gardener.cloud/v1beta1
+      kind: Seed
+      metadata:
+        name: sweet-seed
+      spec:
+        # ... seed spec
+```
+
+<Note>
+Deleting the `Gardenlet` resource does not stop the running gardenlet — it continues operating with its current configuration. However, self-upgrades will no longer happen. To re-enable them, recreate the `Gardenlet` resource or redeploy the Helm chart.
+</Note>
+
+## Garden Cluster Connection
+
+When using `gardener-operator`, the garden cluster connection is configured automatically. The address is derived from the `Garden` resource as `"api." + garden.spec.virtualCluster.dns.domains[0]`. You can inspect or override this with `gardenClusterAddress` in the `Gardenlet` resource, but this is not recommended for most setups.

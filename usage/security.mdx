@@ -1,0 +1,378 @@
+---
+title: Security Features for Gardener Shoot Clusters
+description: Configure ETCD encryption, audit logging, PodSecurity admission, OIDC authentication, ServiceAccount settings, and seccomp profiles for Shoot clusters.
+---
+
+Gardener provides multiple security features to harden Shoot clusters. These include encrypting sensitive data in etcd, structured audit logging, PodSecurity admission controls, OpenID Connect integration, and automatic management of credentials. This page covers each feature with configuration examples sourced directly from the Shoot spec.
+
+## ETCD Encryption at Rest
+
+Kubernetes API server can encrypt resources before writing them to etcd. Gardener **always encrypts `Secrets`** in etcd. You can extend encryption to additional resource types using `spec.kubernetes.kubeAPIServer.encryptionConfig`:
+
+```yaml
+spec:
+  kubernetes:
+    kubeAPIServer:
+      encryptionConfig:
+        resources:
+          - configmaps
+          - statefulsets.apps
+          - customresource.fancyoperator.io
+        provider:
+          type: "aescbc"   # Only supported type
+```
+
+<Note>
+- Each item in `resources` must be a Kubernetes resource name in plural form (e.g., `configmaps`, `statefulsets.apps`). Wildcards are not supported.
+- Adding a resource causes the API server to rewrite existing objects of that type on next modification to encrypt them.
+- Removing a resource causes existing objects to be rewritten as plain text on next modification.
+</Note>
+
+### ETCD Encryption Key Rotation
+
+The encryption key should be rotated regularly. Trigger rotation with an annotation:
+
+```bash
+kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+  gardener.cloud/operation=rotate-etcd-encryption-key
+```
+
+Rotation happens in two automatic phases:
+1. A new key is created alongside the old key. All Secrets (and resources in `encryptionConfig`) are rewritten with the new key.
+2. The old key is removed.
+
+You can check the rotation phase:
+
+```bash
+kubectl -n <shoot-namespace> get shoot <shoot-name> \
+  -o jsonpath='{.status.credentials.rotation.etcdEncryptionKey}'
+```
+
+## Audit Logging
+
+Gardener deploys a default audit policy with the `kube-apiserver`. For custom audit requirements, deploy an `AuditPolicy` in a `ConfigMap` in your project namespace and reference it in the Shoot spec.
+
+<Steps>
+  <Step title="Create the audit policy ConfigMap">
+    The policy must be stored under the `policy` key in the ConfigMap's `data` section.
+
+    ```yaml
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: auditpolicy
+      namespace: garden-my-project
+    data:
+      policy: |
+        apiVersion: audit.k8s.io/v1
+        kind: Policy
+        rules:
+        - level: RequestResponse
+          resources:
+          - group: ""
+            resources: ["secrets", "configmaps"]
+        - level: Metadata
+          resources:
+          - group: ""
+            resources: ["pods"]
+        - level: None
+          verbs: ["get", "watch", "list"]
+    ```
+  </Step>
+  <Step title="Reference the ConfigMap in the Shoot spec">
+    ```yaml
+    spec:
+      kubernetes:
+        kubeAPIServer:
+          auditConfig:
+            auditPolicy:
+              configMapRef:
+                name: auditpolicy
+    ```
+  </Step>
+  <Step title="Trigger reconciliation (optional)">
+    Gardener does not automatically roll out audit policy changes on `ConfigMap` update. To apply changes immediately:
+
+    ```bash
+    kubectl -n garden-<project-name> annotate shoot <shoot-name> \
+      gardener.cloud/operation=reconcile
+    ```
+  </Step>
+</Steps>
+
+To revert to the default audit policy, remove the `auditPolicy.configMapRef` section from the Shoot spec.
+
+## PodSecurity Admission
+
+The `PodSecurity` admission plugin enforces Pod Security Standards at the namespace level. Gardener allows customizing the plugin configuration through the Shoot spec:
+
+```yaml
+spec:
+  kubernetes:
+    kubeAPIServer:
+      admissionPlugins:
+      - name: PodSecurity
+        config:
+          apiVersion: pod-security.admission.config.k8s.io/v1
+          kind: PodSecurityConfiguration
+          defaults:
+            enforce: "baseline"
+            enforce-version: "latest"
+            audit: "restricted"
+            audit-version: "latest"
+            warn: "restricted"
+            warn-version: "latest"
+          exemptions:
+            usernames: []
+            runtimeClasses: []
+            namespaces:
+            - my-privileged-namespace
+```
+
+<Note>
+Gardener automatically adds `kube-system` to `exemptions.namespaces` to ensure system components are never blocked by the PodSecurity policy.
+</Note>
+
+Valid enforcement levels are:
+- `privileged` — No restrictions (the default)
+- `baseline` — Prevents known privilege escalations
+- `restricted` — Heavily restricted, follows current Pod hardening best practices
+
+## Structured Authentication Configuration
+
+For Kubernetes clusters ≥ 1.30, configure authentication using the structured `AuthenticationConfiguration` format instead of legacy OIDC flags.
+
+<Steps>
+  <Step title="Create a ConfigMap with the AuthenticationConfiguration">
+    ```yaml
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: authentication-config
+      namespace: garden-my-project
+    data:
+      config.yaml: |
+        apiVersion: apiserver.config.k8s.io/v1beta1
+        kind: AuthenticationConfiguration
+        jwt:
+        - issuer:
+            url: https://issuer.example.com
+            audiences:
+            - my-client-id
+            audienceMatchPolicy: MatchAny
+          claimMappings:
+            username:
+              expression: 'claims.username'
+            groups:
+              expression: 'claims.groups'
+          claimValidationRules:
+          - expression: 'claims.hd == "example.com"'
+            message: "hosted domain must be example.com"
+    ```
+  </Step>
+  <Step title="Reference the ConfigMap in the Shoot spec">
+    ```yaml
+    spec:
+      kubernetes:
+        kubeAPIServer:
+          structuredAuthentication:
+            configMapName: authentication-config
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+Changes to the referenced `ConfigMap` are picked up on the next Shoot reconciliation. To apply changes immediately, trigger an explicit reconciliation.
+</Warning>
+
+### Configuring Anonymous Authentication
+
+Anonymous authentication is disabled by default in Gardener. For Kubernetes ≥ 1.35, use the anonymous authenticator in `AuthenticationConfiguration`:
+
+```yaml
+data:
+  config.yaml: |
+    apiVersion: apiserver.config.k8s.io/v1beta1
+    kind: AuthenticationConfiguration
+    anonymous:
+      enabled: true
+      conditions:
+      - path: /livez   # Restrict to specific paths for safety
+```
+
+<Warning>
+Enabling anonymous authentication allows unauthenticated requests to reach your API server. Ensure appropriate RBAC authorization policies are in place before enabling.
+</Warning>
+
+## Structured Authorization Configuration
+
+Configure webhook-based authorization using the structured `AuthorizationConfiguration` format:
+
+```yaml
+spec:
+  kubernetes:
+    kubeAPIServer:
+      structuredAuthorization:
+        configMapName: authorization-config
+        kubeconfigs:
+        - authorizerName: my-webhook
+          secretName: webhook-kubeconfig
+```
+
+The ConfigMap contains the `AuthorizationConfiguration`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authorization-config
+  namespace: garden-my-project
+data:
+  config.yaml: |
+    apiVersion: apiserver.config.k8s.io/v1beta1
+    kind: AuthorizationConfiguration
+    authorizers:
+    - type: Webhook
+      name: my-webhook
+      webhook:
+        timeout: 3s
+        subjectAccessReviewVersion: v1
+        failurePolicy: Deny
+        matchConditions:
+        - expression: request.resourceAttributes.namespace == 'kube-system'
+```
+
+The Secret referenced in `kubeconfigs[].secretName` must contain a `kubeconfig` key with the webhook server's address:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webhook-kubeconfig
+  namespace: garden-my-project
+data:
+  kubeconfig: <base64-encoded-kubeconfig>
+```
+
+<Note>
+All webhook authorizers are added after the `RBAC` and `Node` authorizers. If RBAC already allows a request, the webhook authorizer may not be called.
+</Note>
+
+## OpenID Connect (Legacy)
+
+<Warning>
+OpenID Connect configuration via `spec.kubernetes.kubeAPIServer.oidcConfig` is **deprecated** in favor of Structured Authentication Configuration. Setting OIDC configurations is forbidden for clusters with Kubernetes version ≥ 1.32.
+</Warning>
+
+For clusters on Kubernetes < 1.32, OIDC can still be configured directly:
+
+```yaml
+spec:
+  kubernetes:
+    kubeAPIServer:
+      oidcConfig:
+        issuerURL: https://identity.example.com
+        clientID: my-client-id
+        usernameClaim: username
+        groupsClaim: groups
+        groupsPrefix: "oidc:"
+        signingAlgs:
+        - RS256
+```
+
+### OpenIDConnectPreset / ClusterOpenIDConnectPreset
+
+These resources allow you to inject OIDC configuration automatically into new Shoots matching a label selector:
+
+```yaml
+apiVersion: settings.gardener.cloud/v1alpha1
+kind: OpenIDConnectPreset
+metadata:
+  name: default-oidc
+  namespace: garden-my-project
+spec:
+  shootSelector:
+    matchLabels:
+      oidc: enabled   # Shoots must opt in with this label
+  server:
+    clientID: my-client-id
+    issuerURL: https://identity.example.com
+    usernameClaim: username
+    groupsClaim: groups
+    groupsPrefix: "oidc:"
+    signingAlgs:
+    - RS256
+  weight: 90
+```
+
+`ClusterOpenIDConnectPreset` works the same way but is cluster-scoped and can target shoots across multiple projects using a `projectSelector`.
+
+## ServiceAccount Configurations
+
+```yaml
+spec:
+  kubernetes:
+    kubeAPIServer:
+      serviceAccountConfig:
+        issuer: https://my-custom-issuer.example.com
+        acceptedIssuers:
+        - https://old-issuer.example.com  # Keep old issuer accepted during migration
+        extendTokenExpiration: true
+        maxTokenExpiration: 45d           # Must be in the range [30d, 90d]
+```
+
+<Warning>
+If you change from issuer `A` to issuer `B`, you must add `A` to `acceptedIssuers`. Otherwise, existing ServiceAccount tokens will be rejected immediately, causing control plane and workload failures. Wait at least 12 hours and roll all pods before removing `A` from `acceptedIssuers`.
+</Warning>
+
+### Managed Service Account Issuer
+
+Gardener can manage the service account issuer centrally via the Gardener Discovery Server. Enable it by annotating the Shoot:
+
+```bash
+kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+  authentication.gardener.cloud/issuer=managed
+```
+
+<Note>
+Once the managed issuer is enabled, it cannot be disabled. The managed issuer is incompatible with a manually set `serviceAccountConfig.issuer`.
+</Note>
+
+Retrieve the managed issuer URL after reconciliation:
+
+```bash
+kubectl -n my-project get shoot my-shoot \
+  -o jsonpath='{.status.advertisedAddresses[?(@.name=="service-account-issuer")].url}'
+```
+
+## Default Seccomp Profile
+
+Gardener can configure kubelet to apply the `RuntimeDefault` seccomp profile to all pods that don't specify one explicitly:
+
+```yaml
+spec:
+  kubernetes:
+    kubelet:
+      seccompDefault: true
+```
+
+This sets the kubelet `seccompDefault` flag to `true`, instructing the container runtime to apply its default seccomp profile to pods that don't specify `spec.securityContext.seccompProfile`. This profile is more restrictive than `Unconfined` (disabled) and provides a reasonable security baseline.
+
+<Note>
+The `seccompDefault: true` setting requires the `SeccompDefault` feature gate to be enabled in kubelet, which is the default from Kubernetes 1.27 onward. This flag was promoted to GA in Kubernetes 1.30.
+</Note>
+
+## Access Restrictions
+
+Shoot clusters can be annotated with access restrictions that limit which support staff can access the cluster. These are configured by Gardener operators at the `Seed` or `CloudProfile` level and exposed in the Shoot spec:
+
+```yaml
+spec:
+  accessRestrictions:
+  - name: eu-access-only
+    options:
+      support.gardener.cloud/eu-access-for-cluster-addons: "false"
+      support.gardener.cloud/eu-access-for-cluster-nodes: "true"
+```
+
+Access restrictions are informational annotations that Gardener landscapes can use to enforce data sovereignty requirements (e.g., restricting support access for EU-regulatory compliance).

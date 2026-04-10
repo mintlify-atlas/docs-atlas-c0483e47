@@ -1,0 +1,257 @@
+---
+title: "Feature Gates in Gardener Components"
+description: "Overview of Gardener feature gates, how to configure them per component, and a full reference of all Alpha, Beta, and graduated features."
+---
+
+Feature gates are key-value pairs that control experimental or evolving functionality in Gardener components. They allow administrators to enable features before they reach General Availability, or to opt out of features that are enabled by default. Each Gardener component has its own set of relevant feature gates, configured through that component's configuration file.
+
+## How Feature Gates Work
+
+Feature gates are configured in a component's configuration file under the `featureGates` map. For example, to enable the `DefaultSeccompProfile` feature in gardenlet:
+
+```yaml
+apiVersion: gardenlet.config.gardener.cloud/v1alpha1
+kind: GardenletConfiguration
+featureGates:
+  DefaultSeccompProfile: true
+  IstioTLSTermination: false
+```
+
+The same pattern applies to `gardener-operator`, `gardener-apiserver`, and other components.
+
+<Note>
+All feature gates that are relevant for `gardenlet` are also relevant for `gardenadm`.
+</Note>
+
+## Feature Lifecycle Stages
+
+<Tabs>
+  <Tab title="Alpha">
+    An Alpha feature means:
+
+    - **Disabled by default** — must be explicitly enabled
+    - May be buggy; enabling it may expose bugs
+    - Support may be dropped at any time without notice
+    - The API may change in incompatible ways in a later release without notice
+    - Recommended only for short-lived testing clusters
+
+    Alpha features carry the highest risk. Use them only when you are prepared to handle instability and potential breaking changes in subsequent releases.
+  </Tab>
+  <Tab title="Beta">
+    A Beta feature means:
+
+    - **Enabled by default** — must be explicitly disabled to opt out
+    - The feature is well-tested; enabling it is considered safe
+    - The overall feature will not be dropped, though details may change
+    - The schema or semantics of objects may change in incompatible ways in a subsequent beta or stable release — migration instructions will be provided
+    - Recommended for non-critical uses only, due to potential for incompatible changes
+
+    Try Beta features and provide feedback. After they exit beta, making further changes becomes impractical.
+  </Tab>
+  <Tab title="General Availability (GA)">
+    A GA (stable) feature means:
+
+    - **Always enabled** — cannot be disabled
+    - The corresponding feature gate is no longer needed (it will eventually be removed)
+    - Stable versions will appear in released software for many subsequent versions
+
+    Once a feature reaches GA, its feature gate entry is kept for a short period and then removed from the codebase entirely.
+  </Tab>
+</Tabs>
+
+## Reading the Feature Tables
+
+- **Since**: The Gardener release when the feature was introduced at that stage
+- **Until**: The last release in which the feature gate was available (empty = still present)
+- **Default**: Whether the feature is on (`true`) or off (`false`) by default at that stage
+
+## Active Alpha and Beta Feature Gates
+
+These feature gates are currently in development and may be configured on your components:
+
+| Feature | Default | Stage | Since | Until |
+|---|---|---|---|---|
+| DefaultSeccompProfile | `false` | Alpha | 1.54 | |
+| InPlaceNodeUpdates | `false` | Alpha | 1.113 | |
+| IstioTLSTermination | `false` | Alpha | 1.114 | |
+| CloudProfileCapabilities | `false` | Alpha | 1.117 | |
+| OpenTelemetryCollector | `false` | Alpha | 1.124 | 1.135 |
+| OpenTelemetryCollector | `true` | Beta | 1.136 | |
+| UseUnifiedHTTPProxyPort | `false` | Alpha | 1.130 | 1.139 |
+| UseUnifiedHTTPProxyPort | `true` | Beta | 1.140 | |
+| VPAInPlaceUpdates | `false` | Alpha | 1.133 | 1.137 |
+| VPAInPlaceUpdates | `true` | Beta | 1.138 | |
+| VictoriaLogsBackend | `false` | Alpha | 1.137 | |
+| CustomDNSServerInNodeLocalDNS | `true` | Beta | 1.133 | |
+| VPNBondingModeRoundRobin | `false` | Alpha | 1.135 | |
+| PrometheusHealthChecks | `false` | Alpha | 1.135 | |
+| RemoveVali | `false` | Alpha | 1.140 | |
+| VersionClassificationLifecycle | `false` | Alpha | 1.137 | |
+| NewWorkerPoolHash | `true` | Beta | 1.126 | 1.140 |
+| NewWorkerPoolHash | `true` | GA | 1.141 | |
+| DoNotCopyBackupCredentials | `true` | GA | 1.134 | |
+
+## Feature Gate Descriptions
+
+<AccordionGroup>
+  <Accordion title="DefaultSeccompProfile — gardenlet, gardener-operator">
+    Enables defaulting of the seccomp profile for Gardener-managed workload in the `garden` or seed to `RuntimeDefault`. This improves the security posture of Gardener-managed pods by applying a restrictive seccomp profile by default.
+
+    **Stage**: Alpha (since 1.54) | **Default**: `false`
+  </Accordion>
+
+  <Accordion title="InPlaceNodeUpdates — gardener-apiserver">
+    Enables setting the update strategy of worker pools to `AutoInPlaceUpdate` or `ManualInPlaceUpdate` in the Shoot API. This allows node OS updates to be applied in place without requiring node replacement.
+
+    **Stage**: Alpha (since 1.113) | **Default**: `false`
+  </Accordion>
+
+  <Accordion title="IstioTLSTermination — gardenlet, gardener-operator">
+    Enables TLS termination for the Istio Ingress Gateway instead of TLS termination at the `kube-apiserver`. This allows load-balancing of requests to the `kube-apiserver` on request level instead of connection level, potentially improving scalability.
+
+    **Stage**: Alpha (since 1.114) | **Default**: `false`
+  </Accordion>
+
+  <Accordion title="CloudProfileCapabilities — gardener-apiserver">
+    Enables the use of capabilities in the `CloudProfile`. Capabilities create a relation between machine types and machine images, allowing validation of worker groups in a shoot to ensure the selected image and machine combination will boot successfully. Also used to determine valid upgrade paths during automated maintenance.
+
+    **Stage**: Alpha (since 1.117) | **Default**: `false`
+  </Accordion>
+
+  <Accordion title="OpenTelemetryCollector — gardenlet">
+    Routes logs through an instance of an `OpenTelemetry Collector` in the control plane of `Shoot`s. This enables centralized log collection using the OpenTelemetry standard before they reach the log aggregation backend.
+
+    **Stage**: Alpha (1.124–1.135), Beta (1.136+) | **Default**: `false` → `true`
+  </Accordion>
+
+  <Accordion title="UseUnifiedHTTPProxyPort — gardenlet">
+    Enables the API server proxy and shoot VPN client to connect to the unified port using the new `X-Gardener-Destination` header. Simplifies port management in seed clusters.
+
+    **Stage**: Alpha (1.130–1.139), Beta (1.140+) | **Default**: `false` → `true`
+  </Accordion>
+
+  <Accordion title="VPAInPlaceUpdates — gardenlet, gardener-operator">
+    Enables the use of in-place Pod resource updates in `Shoot`, `Seed`, and `Garden` cluster Vertical Pod Autoscaler deployments. Allows VPA to adjust pod resources without pod restart when supported by the container runtime.
+
+    **Stage**: Alpha (1.133–1.137), Beta (1.138+) | **Default**: `false` → `true`
+  </Accordion>
+
+  <Accordion title="VictoriaLogsBackend — gardenlet, gardener-operator">
+    Enables the deployment of a `VictoriaLogs` instance in the control plane of `Shoot`s and the `garden` namespace of `Seed` and `Garden` clusters. `VictoriaLogs` replaces `Vali` as the log aggregation system. Requires `RemoveVali` to be enabled for full migration.
+
+    **Stage**: Alpha (since 1.137) | **Default**: `false`
+  </Accordion>
+
+  <Accordion title="CustomDNSServerInNodeLocalDNS — gardenlet">
+    Enables custom server block support for NodeLocalDNS in the custom CoreDNS configuration of shoot clusters. Allows administrators to specify custom upstream DNS servers within the node-local DNS cache.
+
+    **Stage**: Beta (since 1.133) | **Default**: `true`
+  </Accordion>
+
+  <Accordion title="VPNBondingModeRoundRobin — gardenlet">
+    Enables round-robin bonding mode for HA VPN connections, increasing availability in network degradation scenarios. Both VPN servers are used simultaneously instead of a primary/backup setup. This means `vpn-seed-server-0` and `vpn-seed-server-1` share load equally.
+
+    **Stage**: Alpha (since 1.135) | **Default**: `false`
+  </Accordion>
+
+  <Accordion title="PrometheusHealthChecks — gardenlet, gardener-operator">
+    Enables care controllers to query Prometheus for enhanced health checks of monitoring components. Detected health issues are reported in the respective `Shoot`, `Seed`, or `Garden` resource's status conditions.
+
+    **Stage**: Alpha (since 1.135) | **Default**: `false`
+  </Accordion>
+
+  <Accordion title="RemoveVali — gardenlet, gardener-operator">
+    Enables the automatic removal of `Vali` log aggregation components once `VictoriaLogs` has been enabled for 2 weeks. Requires the `VictoriaLogsBackend` feature gate to be enabled first.
+
+    **Stage**: Alpha (since 1.140) | **Default**: `false`
+  </Accordion>
+
+  <Accordion title="VersionClassificationLifecycle — gardener-apiserver">
+    Enables the features introduced by GEP-32, including lifecycle-based classification for Kubernetes and machine image versions. Provides a more structured approach to managing version lifecycles in `CloudProfile`s.
+
+    **Stage**: Alpha (since 1.137) | **Default**: `false`
+  </Accordion>
+
+  <Accordion title="NewWorkerPoolHash — gardenlet">
+    Enables the new worker pool hash calculation. The new calculation supports rolling worker pools when `kubeReserved`, `systemReserved`, `evictionHard`, or `cpuManagerPolicy` in the `kubelet` configuration change. All provider extensions must be upgraded to support this feature before enabling it.
+
+    Existing worker pools are not immediately migrated (which would trigger full node replacement). Migration happens when a rolling update is triggered by either the old or new hash version calculation.
+
+    **Stage**: Alpha (1.98–1.125), Beta (1.126–1.140), GA (1.141+) | **Default**: `false` → `true`
+  </Accordion>
+
+  <Accordion title="DoNotCopyBackupCredentials — gardenlet">
+    Disables the automatic copying of shoot infrastructure credentials as backup credentials when the shoot is used as a `ManagedSeed`. Operators must explicitly provide backup credentials. Credentials that were already copied are labeled with `secret.backup.gardener.cloud/status=previously-managed` and must be cleaned up manually.
+
+    **Stage**: Alpha (1.121–1.122), Beta (1.123–1.133), GA (1.134+) | **Default**: `false` → `true`
+  </Accordion>
+</AccordionGroup>
+
+## Graduated and Removed Feature Gates
+
+The following features have reached GA or been removed. They are listed here for historical reference and for operators tracking configuration changes across upgrades.
+
+<AccordionGroup>
+  <Accordion title="Recently Graduated (GA)">
+    | Feature | GA Since | Removed Since |
+    |---|---|---|
+    | NodeAgentAuthorizer | 1.123 | 1.124 |
+    | RemoveAPIServerProxyLegacyPort | 1.122 | 1.123 |
+    | ShootCredentialsBinding | 1.133 | 1.134 |
+    | CredentialsRotationWithoutWorkersRollout | 1.127 | 1.129 |
+    | UseNamespacedCloudProfile | 1.125 | 1.129 |
+    | NewVPN | 1.116 | 1.127 |
+    | ShootForceDeletion | 1.111 | 1.120 |
+    | MachineControllerManagerDeployment | 1.82 | 1.92 |
+    | UseGardenerNodeAgent | 1.90 | 1.92 |
+    | APIServerFastRollout | 1.90 | 1.92 |
+    | CoreDNSQueryRewriting | 1.97 | 1.101 |
+    | MutableShootSpecNetworkingNodes | 1.97 | 1.101 |
+    | VPAForETCD | 1.105 | 1.109 |
+    | VPAAndHPAForAPIServer | 1.105 | 1.109 |
+    | WorkerlessShoots | 1.86 | 1.88 |
+    | ContainerdRegistryHostsDir | 1.87 | 1.88 |
+  </Accordion>
+
+  <Accordion title="Deprecated and Removed">
+    | Feature | Last Stage | Removed Since |
+    |---|---|---|
+    | HAControlPlanes | GA | 1.74 |
+    | FullNetworkPoliciesInRuntimeCluster | GA | 1.74 |
+    | ReversedVPN | GA | 1.70 |
+    | ManagedIstio | Deprecated | 1.70 |
+    | APIServerSNI | Deprecated | 1.73 |
+    | SeedKubeScheduler | Deprecated | 1.61 |
+    | HVPA | Deprecated | 1.109 |
+    | HVPAForShootedSeed | Deprecated | 1.109 |
+    | IPv6SingleStack | Alpha | 1.107 |
+    | KonnectivityTunnel | Alpha | 1.27 |
+    | Logging | Alpha | 1.41 |
+    | NodeLocalDNS | Alpha | 1.26 |
+  </Accordion>
+</AccordionGroup>
+
+## Configuring Feature Gates Per Component
+
+Each Gardener component reads its feature gates from its component configuration file. Below are the relevant configuration sections for each component:
+
+<Tabs>
+  <Tab title="gardenlet">
+    ```yaml
+    apiVersion: gardenlet.config.gardener.cloud/v1alpha1
+    kind: GardenletConfiguration
+    featureGates:
+      DefaultSeccompProfile: true
+      VictoriaLogsBackend: false
+      NewWorkerPoolHash: true
+    ```
+
+    See the [full gardenlet configuration example](https://github.com/gardener/gardener/blob/master/example/20-componentconfig-gardenlet.yaml) for all available options.
+  </Tab>
+  <Tab title="gardener-operator">
+    Feature gates for `gardener-operator` are specified in its Helm chart values or configuration. Gates marked as relevant to `gardener-operator` include: `DefaultSeccompProfile`, `IstioTLSTermination`, `VPAInPlaceUpdates`, `VictoriaLogsBackend`, `PrometheusHealthChecks`, and `RemoveVali`.
+  </Tab>
+  <Tab title="gardener-apiserver">
+    Gates relevant to `gardener-apiserver` include: `InPlaceNodeUpdates`, `CloudProfileCapabilities`, and `VersionClassificationLifecycle`. These are configured as command-line flags or through the API server's feature gate configuration.
+  </Tab>
+</Tabs>

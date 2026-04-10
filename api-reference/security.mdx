@@ -1,0 +1,173 @@
+---
+title: "security.gardener.cloud/v1alpha1 API Reference"
+description: "Reference for security.gardener.cloud/v1alpha1: CredentialsBinding for flexible cloud credentials and WorkloadIdentity for token-based authentication."
+---
+
+The `security.gardener.cloud/v1alpha1` API group provides security-related resources. The two primary resources are `CredentialsBinding`, which replaces the deprecated `SecretBinding` with a more flexible credential reference model, and `WorkloadIdentity`, which enables provider extensions to authenticate to cloud APIs using workload identity mechanisms instead of long-lived static credentials.
+
+```bash
+# List all resource types in the security API group
+kubectl api-resources --api-group=security.gardener.cloud
+```
+
+## Resource types
+
+<AccordionGroup>
+
+  <Accordion title="CredentialsBinding">
+
+`CredentialsBinding` binds a set of cloud provider credentials to a Shoot cluster and optionally associates quotas. Unlike the older `SecretBinding`, it can reference three different credential resource types:
+
+- A plain Kubernetes `Secret` (backward-compatible with `SecretBinding`)
+- An `InternalSecret` (managed by Gardener, stored in the garden cluster)
+- A `WorkloadIdentity` resource (for credential-free, token-based authentication)
+
+### Key fields
+
+<ParamField path="provider.type" type="string" required>
+  The cloud provider type (e.g., `aws`, `azure`, `gcp`). Must match the type in the referenced CloudProfile.
+</ParamField>
+
+<ParamField path="credentialsRef.apiVersion" type="string" required>
+  API version of the referenced credential resource. One of:
+  - `v1` when referencing a `Secret`
+  - `core.gardener.cloud/v1beta1` when referencing an `InternalSecret`
+  - `security.gardener.cloud/v1alpha1` when referencing a `WorkloadIdentity`
+</ParamField>
+
+<ParamField path="credentialsRef.kind" type="string" required>
+  Kind of the referenced resource: `Secret`, `InternalSecret`, or `WorkloadIdentity`.
+</ParamField>
+
+<ParamField path="credentialsRef.name" type="string" required>
+  Name of the referenced credential resource.
+</ParamField>
+
+<ParamField path="credentialsRef.namespace" type="string">
+  Namespace of the referenced credential resource. If omitted, the same namespace as the `CredentialsBinding` is used.
+</ParamField>
+
+<ParamField path="quotas" type="array">
+  Optional list of `Quota` references that limit resource usage for Shoots using this binding.
+</ParamField>
+
+### Referencing a Secret
+
+```yaml
+apiVersion: security.gardener.cloud/v1alpha1
+kind: CredentialsBinding
+metadata:
+  name: my-provider-account
+  namespace: garden-dev
+provider:
+  type: aws
+credentialsRef:
+  apiVersion: v1
+  kind: Secret
+  name: my-aws-credentials
+quotas: []
+```
+
+### Referencing a WorkloadIdentity
+
+```yaml
+apiVersion: security.gardener.cloud/v1alpha1
+kind: CredentialsBinding
+metadata:
+  name: my-provider-account
+  namespace: garden-dev
+provider:
+  type: aws
+credentialsRef:
+  apiVersion: security.gardener.cloud/v1alpha1
+  kind: WorkloadIdentity
+  name: my-provider-account
+quotas: []
+```
+
+<Note>
+  A Shoot references a `CredentialsBinding` via its `spec.credentialsBindingName` field. The binding must be in the same namespace as the Shoot.
+</Note>
+
+  </Accordion>
+
+  <Accordion title="WorkloadIdentity">
+
+`WorkloadIdentity` enables cloud provider authentication using workload identity mechanisms (OIDC tokens, IAM roles, etc.) rather than static access keys or service account JSON files. Gardener issues short-lived tokens to the gardenlet or extensions, which use them to authenticate to the cloud provider without storing any long-lived credentials.
+
+This is the recommended credential approach for cloud providers that support workload identity (AWS IRSA, Azure Workload Identity, GCP Workload Identity Federation, etc.).
+
+### Key spec fields
+
+<ParamField path="spec.audiences" type="array" required>
+  List of audiences for the issued tokens. Tokens are only valid for the specified audiences. Typically set to `["gardener"]`.
+</ParamField>
+
+<ParamField path="spec.targetSystem.type" type="string" required>
+  The cloud provider type this workload identity targets (e.g., `aws`, `azure`, `gcp`).
+</ParamField>
+
+<ParamField path="spec.targetSystem.providerConfig" type="object">
+  Provider-specific configuration for the workload identity (e.g., AWS role ARN, Azure client ID, GCP service account email). The schema is defined by each provider extension.
+</ParamField>
+
+### Status fields
+
+<ResponseField name="status.sub" type="string">
+  The subject identifier for this WorkloadIdentity. This value is used as the `sub` claim in issued tokens and must be configured in the cloud provider's trust policy (e.g., as the principal in an AWS IAM role trust relationship).
+</ResponseField>
+
+### TokenRequest
+
+To obtain a token for a `WorkloadIdentity`, you create a `TokenRequest` sub-resource:
+
+```bash
+kubectl create -f - <<EOF
+apiVersion: security.gardener.cloud/v1alpha1
+kind: TokenRequest
+metadata:
+  name: my-provider-account
+  namespace: garden-dev
+spec:
+  contextObject:
+    kind: Shoot
+    apiVersion: core.gardener.cloud/v1beta1
+    name: my-shoot
+    namespace: garden-dev
+    uid: <shoot-uid>
+  expirationSeconds: 3600
+EOF
+```
+
+The response contains a short-lived token in `status.token` that can be used with the cloud provider's SDK.
+
+### Example
+
+```yaml
+apiVersion: security.gardener.cloud/v1alpha1
+kind: WorkloadIdentity
+metadata:
+  name: my-provider-account
+  namespace: garden-dev
+spec:
+  audiences:
+  - gardener
+  targetSystem:
+    type: aws
+    providerConfig:
+      apiVersion: aws.provider.extensions.gardener.cloud/v1alpha1
+      kind: WorkloadIdentityConfig
+      roleARN: arn:aws:iam::123456789012:role/my-gardener-role
+```
+
+<Tip>
+  WorkloadIdentity is the most secure way to configure cloud provider credentials in Gardener. It eliminates long-lived credentials entirely and integrates with your cloud provider's native IAM workload identity features.
+</Tip>
+
+<Warning>
+  You must configure a trust relationship in your cloud provider's IAM system that allows tokens with the `sub` claim from `status.sub` and the audiences from `spec.audiences` to assume the specified role or access the specified account.
+</Warning>
+
+  </Accordion>
+
+</AccordionGroup>

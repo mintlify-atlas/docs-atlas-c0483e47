@@ -1,0 +1,155 @@
+---
+title: "Gardenlet: The Seed Cluster Agent"
+description: "Understand how the gardenlet acts as Gardener's kubelet analog, managing shoot clusters on a seed via reversed control flow and TLS bootstrapping."
+---
+
+The gardenlet is the primary agent deployed to every seed cluster in a Gardener landscape. Just as the Kubernetes kubelet runs on each worker node and manages pods, the gardenlet runs on each seed cluster and manages all shoot clusters within it. This design mirrors the Kubernetes operator pattern: rather than a central controller talking directly to every seed, responsibility is delegated outward, making the system scalable and resilient.
+
+The following table shows the architectural parallels between Gardener and Kubernetes:
+
+| Gardener Component            | Kubernetes Counterpart    |
+|-------------------------------|---------------------------|
+| `gardener-apiserver`          | `kube-apiserver`          |
+| `gardener-controller-manager` | `kube-controller-manager` |
+| `gardener-scheduler`          | `kube-scheduler`          |
+| `gardenlet`                   | `kubelet`                 |
+
+A key design decision in Gardener is the **reversed control flow**: instead of the `gardener-controller-manager` reaching into seed clusters, the gardenlet contacts the Gardener API server to report status and read desired state. This means seed clusters — and the shoot clusters within them — can sit behind firewalls with no inbound access required.
+
+## TLS bootstrapping
+
+When you deploy the gardenlet into a seed cluster, it follows a bootstrap process similar to the kubelet's TLS bootstrapping:
+
+<Steps>
+  <Step title="Start with bootstrap kubeconfig">
+    The gardenlet starts with a bootstrap `kubeconfig` containing a bootstrap token that grants permission to create `CertificateSigningRequest` (CSR) resources in the garden cluster.
+  </Step>
+  <Step title="Create and wait for CSR approval">
+    The gardenlet creates a CSR. The `gardener-controller-manager` runs a control loop that automatically signs CSRs created by gardenlets.
+  </Step>
+  <Step title="Download client certificate">
+    After the CSR is signed, the gardenlet downloads the issued client certificate and stores a new `kubeconfig` in a `Secret` within the seed cluster.
+  </Step>
+  <Step title="Delete bootstrap kubeconfig and start normal operation">
+    The bootstrap `kubeconfig` secret is deleted and the gardenlet restarts using its new, trusted credentials.
+  </Step>
+</Steps>
+
+<Tip>
+If you prefer to skip the bootstrap process, create a `kubeconfig` pointing to the garden cluster yourself and reference it via the `gardenClientConnection.kubeconfig` field in the gardenlet's component configuration.
+</Tip>
+
+## Certificate rotation
+
+The gardenlet client certificate has a validity period controlled by the `--cluster-signing-duration` flag of the `kube-controller-manager` (default: 1 year). You can also set a custom validity via `.gardenClientConnection.kubeconfigValidity.validity` in the gardenlet configuration — the minimum is `10m`.
+
+By default, after 70–90% of the certificate's lifetime has elapsed, the gardenlet automatically initiates a rotation. You can adjust these thresholds using `.gardenClientConnection.kubeconfigValidity.autoRotationJitterPercentage{Min,Max}`.
+
+<AccordionGroup>
+  <Accordion title="Rotating certificates created via TLS bootstrap">
+    When the gardenlet created its certificate via the TLS bootstrap process, the same `gardener-controller-manager` control loop that signed the initial CSR also automatically approves rotation CSRs.
+
+    To trigger an immediate renewal, annotate the kubeconfig `Secret` in the seed cluster (as specified in `.gardenClientConnection.kubeconfigSecret`) with `gardener.cloud/operation=renew`. Within 10 seconds, the gardenlet detects the annotation, terminates itself, and requests a new certificate.
+
+    Alternatively, annotate the `Seed` resource with `gardener.cloud/operation=renew-kubeconfig`. This causes the gardenlet to annotate its own kubeconfig secret, triggering the same process.
+  </Accordion>
+  <Accordion title="Rotating custom certificates">
+    For certificates not created by the bootstrap process, the x509 certificate's `Subject` must conform to:
+    - Common Name (CN) prefixed with `gardener.cloud:system:seed:`
+    - Organization (O) equal to `gardener.cloud:system:seeds`
+
+    Without this, the `gardener-controller-manager` will not auto-sign the CSR. An external operator must then approve it manually with `kubectl certificate approve seed-csr-<...>`. If not approved within 15 minutes, the gardenlet retries.
+  </Accordion>
+</AccordionGroup>
+
+## Seed configuration
+
+The gardenlet works with a single seed, configured under `.seedConfig` in the `GardenletConfiguration`:
+
+```yaml
+apiVersion: gardenlet.config.gardener.cloud/v1alpha1
+kind: GardenletConfiguration
+seedConfig:
+  metadata:
+    name: my-seed
+  spec:
+    provider:
+      type: aws
+    settings:
+      scheduling:
+        visible: true
+```
+
+On startup, the gardenlet registers a `Seed` resource using this template if one does not already exist.
+
+## Heartbeats
+
+The gardenlet uses Kubernetes `Lease` objects to report heartbeats, analogous to how the kubelet reports node health. Every two seconds, the gardenlet checks the seed cluster's `/healthz` endpoint. On success, it renews a `Lease` in the garden cluster's `gardener-system-seed-lease` namespace and sets the `GardenletReady` condition to `True` on the `Seed` resource.
+
+If the lease is not renewed, the `seed-lifecycle-controller` in `gardener-controller-manager` sets `GardenletReady` to `Unknown`, and the `gardener-scheduler` stops assigning new shoots to that seed.
+
+<Note>
+The gardenlet's `/healthz` endpoint reports whether the seed's API server is reachable and the lease is being renewed. It does not indicate whether the Gardener extension API server is available — the gardenlet is designed to tolerate such outages and retry.
+</Note>
+
+## Controllers
+
+The gardenlet runs several controllers, each responsible for a specific aspect of seed or shoot management.
+
+<AccordionGroup>
+  <Accordion title="Seed controller">
+    The Seed controller manages seed system components: CA certificates, `CustomResourceDefinition`s, logging and monitoring stacks, and central components like `gardener-resource-manager`, `etcd-druid`, and Istio. It also deploys a `BackupBucket` if `.spec.backup` is set on the `Seed`, and validates that the seed's Kubernetes version meets the minimum supported version.
+
+    A "care" reconciler checks whether the `ManagedResource`s backing system components are healthy, maintaining the `SeedSystemComponentsHealthy` condition. A "lease" reconciler handles the heartbeat process described above.
+  </Accordion>
+  <Accordion title="Shoot controller">
+    The Shoot controller implements the core lifecycle logic for shoot clusters across three task flows:
+
+    - **`reconcile`**: Handles creation, regular reconciliation, and hibernation.
+    - **`migrate`**: Triggered when `spec.seedName` differs from `status.seedName`, initiating control plane migration.
+    - **`delete`**: Triggered when the shoot's `deletionTimestamp` is set.
+
+    A "care" reconciler maintains shoot health conditions including `APIServerAvailable`, `ControlPlaneHealthy`, `EveryNodeReady`, and `SystemComponentsHealthy`. A "state" reconciler periodically backs up `ShootState` resources every 6 hours.
+  </Accordion>
+  <Accordion title="BackupBucket and BackupEntry controllers">
+    These controllers manage `BackupBucket` and `BackupEntry` resources scoped to the gardenlet's seed. They create corresponding `extensions.gardener.cloud/v1alpha1` resources in the seed cluster and wait for extension controllers to reconcile them.
+
+    For deleted shoots, you can configure a grace period before backup entries are removed via `.controllers.backupEntry.deletionGracePeriodHours`. To bypass the grace period and force immediate deletion, annotate the `BackupEntry` with `backupentry.core.gardener.cloud/force-deletion=true`.
+  </Accordion>
+  <Accordion title="ControllerInstallation controller">
+    This controller deploys extension controllers (Helm type) to the seed cluster. For each `ControllerInstallation`, it creates a namespace named `extension-<controller-installation-name>`, unpacks the Helm chart from the `ControllerDeployment`, and deploys the rendered resources via a `ManagedResource`.
+
+    The chart values are extended with Gardener environment information:
+
+    ```yaml
+    gardener:
+      version: <gardenlet-version>
+      garden:
+        clusterIdentity: <identity-of-garden-cluster>
+      seed:
+        name: <seed-name>
+        clusterIdentity: <identity-of-seed-cluster>
+        spec: <seed-specification>
+    ```
+  </Accordion>
+  <Accordion title="ManagedSeed controller">
+    Gardener users can register shoot clusters as seed clusters using `ManagedSeed` resources. The gardenlet managing the underlying shoot cluster then deploys a clone of itself (with the same version and configuration) into the managed seed cluster.
+
+    On reconciliation, the controller waits for the referenced shoot to complete reconciliation, creates the `garden` namespace in the shoot cluster, manages backup and kubeconfig secrets, and deploys a gardenlet into the shoot cluster. On deletion, it reverses these steps in order.
+  </Accordion>
+  <Accordion title="VPAEvictionRequirements controller">
+    This controller manages `EvictionRequirements` on `VerticalPodAutoscaler` objects labeled with `autoscaling.gardener.cloud/eviction-requirements: managed-by-controller`. It can restrict evictions to upscaling only, or allow downscaling only during a shoot's maintenance window.
+  </Accordion>
+</AccordionGroup>
+
+## Self-upgrade mechanism
+
+The gardenlet can upgrade itself by watching a `Gardenlet` resource (in the `seedmanagement.gardener.cloud/v1alpha1` API group) with the same name as its seed. When this resource is present, the gardenlet downloads the Helm chart specified in `.spec.deployment.helm.ociRepository`, renders it, and redeploys itself. Deleting the `Gardenlet` object stops self-upgrades but does not terminate the running gardenlet.
+
+## Managed seeds
+
+When a user creates a `ManagedSeed` resource that references a shoot scheduled on a seed the gardenlet manages, the gardenlet automatically deploys a clone of itself into the shoot cluster. This bootstraps the shoot as a new seed cluster without requiring manual intervention.
+
+<Warning>
+When upgrading Gardener in an environment where the garden runtime cluster is also used as a seed cluster, you must upgrade `gardener-operator` and `gardenlet` in lockstep. Mismatched versions can cause unexpected behavior.
+</Warning>

@@ -1,0 +1,184 @@
+---
+title: "Gardener Extensibility: Architecture Overview"
+description: "How Gardener's out-of-tree extension architecture keeps the core independent of cloud providers while enabling pluggable support for any infrastructure."
+---
+
+Gardener started as a monolithic project where all cloud providers and operating system configurations were built directly into the core codebase. As the project grew, maintaining provider-specific code in-tree became a bottleneck — adding a new provider required changes to the Gardener core itself, slowing down iteration and increasing the surface area for bugs. To address this, the Gardener team proposed [GEP-0001](https://github.com/gardener/enhancements/tree/main/geps/0001-gardener-extensibility), which introduced an out-of-tree extension architecture modeled after Kubernetes' own approach to out-of-tree cloud providers and CSI volume plugins.
+
+Today, Gardener's core logic is entirely provider-independent. All cloud-specific behavior — provisioning infrastructure, deploying cloud-controller-managers, managing DNS records, configuring operating systems — is handled by external extension controllers that communicate with Gardener through well-defined Kubernetes custom resource contracts.
+
+## Why extensibility was needed
+
+The core problem was tight coupling: every new infrastructure provider or operating system required modifying the Gardener core, releasing a new version, and coordinating across all teams. With extensions, a provider team can build and release their extension independently, following a stable contract. Gardener creates extension resources (CRDs) in seed clusters, extension controllers reconcile them and report status back, and Gardener waits for results before proceeding — a clean, asynchronous two-way communication pattern.
+
+## Building blocks
+
+Every Gardener extension consists of up to three building blocks:
+
+<CardGroup cols={3}>
+  <Card title="Extension controller" icon="gear">
+    A Kubernetes controller that reconciles objects in the `extensions.gardener.cloud` API group. It handles provider-specific tasks like infrastructure provisioning or DNS record management.
+  </Card>
+  <Card title="Helm chart" icon="package">
+    A Helm chart (referenced as an OCI artifact) used to deploy the extension controller to garden runtime or seed clusters. This is the vehicle for installation.
+  </Card>
+  <Card title="Admission component" icon="shield-check">
+    An optional admission controller running in the garden runtime cluster. It validates extension-specific configuration in `Shoot` resources, such as `providerConfig` blobs.
+  </Card>
+</CardGroup>
+
+## Kinds and types
+
+Extensions are organized by **Kind** and **Type**. Kinds are defined by Gardener (e.g., `Infrastructure`, `Worker`, `DNSRecord`) and represent a category of work. Types are defined by extension authors and identify which extension handles a given resource.
+
+For example, the following resource is of Kind `Infrastructure` and Type `local`, meaning an extension registered for the `local` type must reconcile it:
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Infrastructure
+metadata:
+  name: infrastructure
+  namespace: shoot--core--aws-01
+spec:
+  type: local
+```
+
+Gardener itself never evaluates the `providerConfig` in extension resources — it simply forwards whatever the user specified in the `Shoot` resource. Only the responsible extension controller understands and acts on that configuration.
+
+## Extension classes
+
+A Gardener landscape contains multiple cluster types. The `.spec.class` field on extension resources identifies which context the extension is serving:
+
+<AccordionGroup>
+  <Accordion title="Garden class">
+    Extension controllers in the **garden** class run in the garden runtime cluster. They serve garden-level concerns such as installing certificates for API and ingress endpoints. During `Garden` reconciliation, `gardener-operator` creates `BackupBucket`, `DNSRecord`, and `Extension` resources (in the `extensions.gardener.cloud` group) that trigger these controllers.
+  </Accordion>
+  <Accordion title="Seed class">
+    Extension controllers in the **seed** class run in the seed cluster and serve seed-level concerns — for example, requesting a wildcard certificate for the seed's ingress domain. During `Seed` reconciliation, `gardenlet` creates `DNSRecord` and `Extension` resources that trigger these controllers.
+  </Accordion>
+  <Accordion title="Shoot class">
+    Extension controllers in the **shoot** class run in the seed but serve individual shoot clusters — for example, deploying a certificate controller into the shoot's control-plane namespace. During `Shoot` reconciliation, `gardenlet` creates various extension resources that trigger these controllers.
+  </Accordion>
+</AccordionGroup>
+
+## How gardenlet creates extension resources
+
+During shoot reconciliation, `gardenlet` writes CRDs into the seed cluster describing the desired state. Extension controllers watch these CRDs, reconcile the described infrastructure or configuration, and write results back into the `.status` field. Gardener monitors `.status.lastOperation` and `.status.lastError` to determine when to proceed.
+
+**Example: infrastructure provisioning**
+
+When Gardener creates a new AWS shoot cluster, it needs infrastructure to be set up (VPCs, subnets, security groups, IAM roles). It writes the following resource into the seed:
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Infrastructure
+metadata:
+  name: infrastructure
+  namespace: shoot--core--aws-01
+spec:
+  type: aws
+  providerConfig:
+    apiVersion: aws.provider.extensions.gardener.cloud/v1alpha1
+    kind: InfrastructureConfig
+    networks:
+      vpc:
+        cidr: 10.250.0.0/16
+      internal:
+      - 10.250.112.0/22
+      public:
+      - 10.250.96.0/22
+      workers:
+      - 10.250.0.0/19
+    zones:
+    - eu-west-1a
+  dns:
+    apiserver: api.aws-01.core.example.com
+  region: eu-west-1
+  secretRef:
+    name: my-aws-credentials
+  sshPublicKey: |
+    base64(key)
+```
+
+The AWS extension controller picks this up and starts provisioning. When done, it writes results back:
+
+```yaml
+status:
+  observedGeneration: ...
+  state: ...
+  lastError: ..
+  lastOperation: ...
+  providerStatus:
+    apiVersion: aws.provider.extensions.gardener.cloud/v1alpha1
+    kind: InfrastructureStatus
+    vpc:
+      id: vpc-1234
+      subnets:
+      - id: subnet-acbd1234
+        name: workers
+        zone: eu-west-1
+      securityGroups:
+      - id: sg-xyz12345
+        name: workers
+    iam:
+      nodesRoleARN: <some-arn>
+      instanceProfileName: foo
+    ec2:
+      keyName: bar
+```
+
+The `.status.providerStatus` is opaque to Gardener — it forwards it to subsequent extension resources (like `Worker`) that need it.
+
+## Two-way communication and webhooks
+
+The extension pattern is not limited to Gardener creating resources and extensions reporting status. Extensions can also register `MutatingWebhookConfiguration` objects to intercept and modify resources that Gardener deploys into seed namespaces.
+
+**Example: kube-controller-manager customization**
+
+Gardener deploys a standard `kube-controller-manager` without any provider-specific flags. An AWS extension controller registers a webhook that intercepts this deployment and injects cloud-specific flags:
+
+```yaml
+        - --cloud-provider=external
+        - --external-cloud-volume-plugin=aws
+        - --cloud-config=/etc/kubernetes/cloudprovider/cloudprovider.conf
+```
+
+The extension would also create the corresponding `ConfigMap` for the cloud config and add the necessary volume mounts. This webhook-based approach lets extensions modify standard Gardener-deployed components without Gardener needing to know anything about provider-specific requirements.
+
+## The Cluster resource
+
+Extension controllers often need information beyond what is in their specific CRD — for example, the shoot's pod CIDR or `CloudProfile` data. Gardener solves this by writing a `Cluster` resource into each shoot's namespace in the seed before reconciliation begins:
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Cluster
+metadata:
+  name: shoot--foo--bar
+spec:
+  cloudProfile:
+    apiVersion: core.gardener.cloud/v1beta1
+    kind: CloudProfile
+    ...
+  seed:
+    apiVersion: core.gardener.cloud/v1beta1
+    kind: Seed
+    ...
+  shoot:
+    apiVersion: core.gardener.cloud/v1beta1
+    kind: Shoot
+    ...
+```
+
+Think of `Cluster` as a read-only `ConfigMap` containing the full context of the shoot. Extension controllers can extract any information they need from it.
+
+<Note>
+Extension controllers reconciling resources in the `garden` namespace (not associated with a specific shoot) must tolerate the absence of a `Cluster` resource. They should either not attempt to read it or ignore "not found" errors.
+</Note>
+
+## Registration
+
+Before an extension can be used, it must be registered with the system. The `gardener-operator` automates this process using `Extension` resources in the `operator.gardener.cloud` group. See [Extension registration](/extensions/registration) for details on how to register and configure extensions.
+
+## Known extensions
+
+The Gardener project maintains a list of known extension implementations covering infrastructure providers (AWS, Azure, GCP, OpenStack, and more), networking plugins (Calico, Cilium), operating systems (Garden Linux, Flatcar, Ubuntu), and various service extensions. Extension authors are encouraged to list their implementations in the community registry.

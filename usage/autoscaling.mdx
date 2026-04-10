@@ -1,0 +1,381 @@
+---
+title: Autoscaling in Gardener Shoot Clusters
+description: Configure cluster-autoscaler, VPA, DNS autoscaling, and in-place resource updates in Gardener Shoot clusters, with pod autoscaling best practices.
+---
+
+Gardener Shoot clusters support three complementary autoscaling dimensions: horizontal node scaling via the cluster autoscaler, horizontal pod scaling via HPA (built into `kube-controller-manager`), and vertical pod scaling via VPA. Each is independently configurable in the Shoot spec.
+
+## Horizontal Node Autoscaling (Cluster Autoscaler)
+
+Every Shoot with at least one worker pool configured with `minimum < maximum` automatically gets a `cluster-autoscaler` deployment. Gardener uses a fork of the upstream cluster-autoscaler that integrates with `machine-controller-manager` for node provisioning.
+
+### Global Cluster Autoscaler Settings
+
+```yaml
+spec:
+  kubernetes:
+    clusterAutoscaler:
+      expander: "priority,least-waste"  # Algorithm for choosing which pool to scale up
+      maxGracefulTerminationSeconds: 600
+      maxNodeProvisionTime: 20m
+      initialNodeGroupBackoffDuration: 5m
+      maxNodeGroupBackoffDuration: 30m
+      nodeGroupBackoffResetTimeout: 3h
+      scaleDownUtilizationThreshold: 0.5
+      scaleDownUnneededTime: 30m
+      scaleDownDelayAfterAdd: 1h
+      scaleDownDelayAfterFailure: 3m
+      scaleDownDelayAfterDelete: 0s
+      scanInterval: 10s
+      maxScaleDownParallelism: 10
+      maxDrainParallelism: 1
+      ignoreDaemonsetsUtilization: false
+      verbosity: 2
+```
+
+Key options explained:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `expander` | `least-waste` | How to pick a node group on scale-up. Options: `least-waste`, `most-pods`, `random`, `priority` |
+| `scaleDownUnneededTime` | `30m` | How long a node must be under-utilized before it's eligible for scale-down |
+| `scaleDownUtilizationThreshold` | `0.5` | Nodes with utilization below this are candidates for removal |
+| `scaleDownDelayAfterAdd` | `1h` | Wait period before scale-down after a scale-up event |
+| `maxNodeProvisionTime` | `20m` | Max time to wait for a new node to become ready before marking the scale-up as failed |
+
+### Per-Worker-Pool Cluster Autoscaler Settings
+
+Override global CA settings for individual worker pools:
+
+```yaml
+spec:
+  provider:
+    workers:
+    - name: cpu-worker
+      clusterAutoscaler:
+        scaleDownUtilizationThreshold: 0.5
+        scaleDownGpuUtilizationThreshold: 0.5
+        scaleDownUnneededTime: 30m
+        scaleDownUnreadyTime: 1h
+        maxNodeProvisionTime: 15m
+```
+
+### Priority-Based Expander
+
+When using the `priority` expander, assign priorities to worker pools. Pools with higher priority are preferred for scale-up:
+
+```yaml
+spec:
+  provider:
+    workers:
+    - name: primary-pool
+      priority: 60      # Higher priority = preferred for scale-up
+      machine:
+        type: m5.large
+    - name: fallback-pool
+      priority: 10      # Used when primary pool nodes are unavailable
+      machine:
+        type: m5.xlarge
+```
+
+When at least one pool has a priority, Gardener generates a `ConfigMap` for the cluster-autoscaler's priority expander. Pools without an explicit priority default to `0`.
+
+### Startup and Status Taints
+
+Configure which node taints the cluster autoscaler should ignore when evaluating utilization:
+
+```yaml
+spec:
+  kubernetes:
+    clusterAutoscaler:
+      startupTaints:
+      - "node.kubernetes.io/memory-pressure"
+      - "node.kubernetes.io/disk-pressure"
+      statusTaints:
+      - "reservedForTenant"
+```
+
+## Horizontal Pod Autoscaling (HPA)
+
+HPA is built into `kube-controller-manager` and always available. Configure the KCM's HPA knobs in the Shoot spec:
+
+```yaml
+spec:
+  kubernetes:
+    kubeControllerManager:
+      horizontalPodAutoscaler:
+        syncPeriod: 30s                # How often HPA recalculates desired replicas
+        tolerance: 0.1                 # Don't scale if desired replicas differ by <10%
+        downscaleStabilization: 5m0s   # Trailing window before scaling in
+        initialReadinessDelay: 30s
+        cpuInitializationPeriod: 5m0s
+```
+
+### Example HPA Resource
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: AverageValue
+        averageValue: 2      # Scale on absolute usage, not utilization
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: AverageValue
+        averageValue: 8G
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 1800
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 300
+```
+
+<Tip>
+When combining HPA with VPA, scale HPA on **usage** (`averageValue`) rather than **utilization** (`averageUtilization`). VPA changes resource requests, which changes utilization but not usage — avoiding a feedback loop between the two autoscalers.
+</Tip>
+
+## Vertical Pod Autoscaling (VPA)
+
+VPA is enabled by default in Gardener Shoots. It automatically adjusts CPU and memory requests based on observed usage. Gardener deploys VPA as part of the Shoot control plane in the seed cluster.
+
+### Enabling and Configuring VPA
+
+```yaml
+spec:
+  kubernetes:
+    verticalPodAutoscaler:
+      enabled: true                          # default: true
+      evictAfterOOMThreshold: 10m0s          # Evict pod if it OOMs within this window since start
+      evictionRateBurst: 1                   # Max pods evicted in one go
+      evictionRateLimit: -1                  # Max pods evicted per second (-1 = disabled)
+      evictionTolerance: 0.5                 # Stop evicting when this fraction of replicas is healthy
+      recommendationMarginFraction: 0.15     # Add 15% safety margin to recommendations
+      updaterInterval: 1m0s                  # How often VPA updater checks recommendations
+      recommenderInterval: 1m0s             # How often VPA recommender recomputes
+      targetCPUPercentile: 0.9              # Target the 90th percentile of observed CPU usage
+      targetMemoryPercentile: 0.9           # Target the 90th percentile of observed memory usage
+      maxAllowed:
+        cpu: 8
+        memory: 32Gi
+```
+
+<Warning>
+If you disable VPA (`enabled: false`) and deploy your own VPA into the cluster, the CRDs will remain after disabling. You can remove them with `kubectl delete crd`. Running two VPA instances targeting the same pods causes conflicts and pod trashing.
+</Warning>
+
+### Example VPA Resource
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: my-app-vpa
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: my-app
+  updatePolicy:
+    updateMode: "InPlaceOrRecreate"   # Prefer in-place; fall back to eviction
+  resourcePolicy:
+    containerPolicies:
+    - containerName: my-app
+      controlledValues: RequestsOnly  # Only adjust requests, not limits
+      minAllowed:
+        cpu: 50m
+        memory: 200M
+      maxAllowed:
+        cpu: 4
+        memory: 16G
+    - containerName: '*'
+      mode: "Off"                     # Ignore all other containers (e.g., sidecars)
+```
+
+VPA update modes:
+
+| Mode | Behavior |
+|------|----------|
+| `Off` | Compute recommendations only; never apply them |
+| `Initial` | Apply on pod creation; never evict for updates |
+| `Recreate` | Apply and evict pods that are out of bounds (default) |
+| `InPlaceOrRecreate` | Apply in-place; fall back to eviction if in-place fails |
+
+## In-Place Resource Updates
+
+In-place pod resource updates allow VPA to resize pod CPU and memory without restarting the pod (when supported by the OS and Kubernetes version).
+
+| Kubernetes Version | Status |
+|-------------------|--------|
+| < 1.27 | Not supported |
+| 1.27 – 1.32 | Alpha; requires `InPlacePodVerticalScaling` feature gate enabled on both kube-apiserver and kubelet |
+| 1.33 – 1.34 | Beta; enabled by default |
+| ≥ 1.35 | GA |
+
+To use in-place updates, ensure the feature gate is not explicitly disabled in the Shoot spec:
+
+```yaml
+spec:
+  kubernetes:
+    kubeAPIServer:
+      featureGates:
+        InPlacePodVerticalScaling: true   # Required only for Kubernetes < 1.33
+    kubelet:
+      featureGates:
+        InPlacePodVerticalScaling: true   # Required only for Kubernetes < 1.33
+```
+
+Then use the `InPlaceOrRecreate` update mode in your VPA resource (as shown above).
+
+## DNS Autoscaling
+
+CoreDNS is the cluster DNS server in Gardener Shoots. Gardener provides two autoscaling modes for CoreDNS:
+
+<Tabs>
+  <Tab title="horizontal (default)">
+    CPU-based HPA. Scales between 2 and 5 replicas. Fully managed, no configuration needed.
+
+    ```yaml
+    spec:
+      systemComponents:
+        coreDNS:
+          autoscaling:
+            mode: horizontal
+    ```
+
+    **When to use:** Works for most workloads. Sufficient when DNS load correlates with CPU usage of CoreDNS pods.
+  </Tab>
+  <Tab title="cluster-proportional">
+    Scales based on the number of nodes and CPU cores in the cluster. More flexible but does not react to actual DNS query load.
+
+    ```yaml
+    spec:
+      systemComponents:
+        coreDNS:
+          autoscaling:
+            mode: cluster-proportional
+    ```
+
+    After enabling, a `coredns-autoscaler` ConfigMap appears in `kube-system`:
+
+    ```yaml
+    linear: '{"coresPerReplica":256,"min":2,"nodesPerReplica":16}'
+    ```
+
+    The replica count formula: `replicas = max( ceil(cores / coresPerReplica), ceil(nodes / nodesPerReplica) )`
+
+    Edit the ConfigMap to tune the ratios for your expected DNS load.
+
+    **When to use:** When CPU-based scaling is insufficient, e.g., large clusters with high DNS query rates, or clusters with changing sizes where you want DNS capacity to grow proportionally.
+  </Tab>
+</Tabs>
+
+### Combining DNS Autoscaling with NodeLocal DNS
+
+[NodeLocal DNS](/usage/networking) runs a cache on every node, significantly reducing traffic to the central CoreDNS pods. When both are enabled:
+
+- Horizontal autoscaling works well alongside NodeLocal DNS since reduced load to CoreDNS lowers the CPU signal.
+- For cluster-proportional autoscaling with NodeLocal DNS, reduce `coresPerReplica` and `nodesPerReplica` to keep the CoreDNS replica count from over-scaling.
+
+## Pod Autoscaling Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Set CPU and memory requests" icon="cpu">
+    Always set resource requests (or let VPA manage them). Requests drive scheduling decisions. Without them, the kube-scheduler places pods arbitrarily.
+  </Card>
+  <Card title="Avoid CPU limits" icon="gauge">
+    CPU limits cause throttling even when nodes have spare capacity. Use requests with no limits unless you know the healthy ceiling.
+  </Card>
+  <Card title="Use PodDisruptionBudgets" icon="shield">
+    Always define PDBs. VPA evicts pods to apply recommendations; without PDBs, all replicas may be evicted simultaneously.
+  </Card>
+  <Card title="Prefer HPA on usage, not utilization" icon="chart-bar">
+    When combining HPA and VPA, scale HPA on `averageValue` (absolute usage) to avoid a feedback loop where VPA-adjusted requests change utilization and trigger HPA.
+  </Card>
+</CardGroup>
+
+### Choosing Between HPA and VPA
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Stateless service with variable traffic | HPA |
+| Service with variable resource needs per request | VPA |
+| Both cases apply | Combine HPA (on custom/external metrics or usage) + VPA |
+| Singleton (cannot scale horizontally) | VPA with `Initial` or `Recreate` mode + fast readiness probe |
+| Daemon set pods | VPA with `Initial` mode (PDBs not supported for DaemonSets) |
+
+### Combining HPA and VPA
+
+HPA and VPA can coexist if they do not target the same scaling metric:
+
+```yaml
+# HPA scales on requests/second (custom metric) — not CPU/memory
+# VPA manages CPU and memory requests
+```
+
+Or configure HPA to scale on usage:
+
+```yaml
+metrics:
+- type: Resource
+  resource:
+    name: cpu
+    target:
+      type: AverageValue      # Use AverageValue (absolute usage), not AverageUtilization
+      averageValue: 500m
+```
+
+### QoS Classes
+
+| QoS Class | When | Recommendation |
+|-----------|------|---------------|
+| `BestEffort` | No requests or limits set | Avoid — the scheduler places these pods anywhere and they may deprive other pods of resources |
+| `Burstable` | Some requests set; limits either absent or different from requests | Prefer — allows burst usage when nodes have headroom |
+| `Guaranteed` | All containers have requests equal to limits | Use only when you are certain about the pod's resource ceiling; CPU throttling and OOM occur even on underutilized nodes |
+
+### Resource Buffering for Faster Scale-Up
+
+Pre-provision capacity using low-priority "placeholder" pods that get evicted when real workloads need the resources:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overprovisioner
+spec:
+  replicas: 3
+  template:
+    spec:
+      priorityClassName: low-priority-buffer  # Must be negative or below zero
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+        resources:
+          requests:
+            cpu: "2"
+            memory: 4Gi
+```
+
+This ensures spare node capacity is available for burst workloads without waiting 3+ minutes for cloud provider provisioning.

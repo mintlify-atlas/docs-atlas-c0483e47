@@ -1,0 +1,338 @@
+---
+title: "Seed Settings and Configuration Reference"
+description: "Full reference for Seed .spec.settings — excess capacity reservation, scheduling, load balancers, VPA, zone selection, and topology-aware routing."
+---
+
+The `Seed` resource exposes a `.spec.settings` section that controls the behavior of Gardener components acting on that seed cluster. These settings influence how the gardenlet manages shoot control planes, how load balancers are created, whether VPA is managed automatically, and more. Understanding these settings is important for operators who want to tune capacity, costs, reliability, and scheduling behavior for their seeds.
+
+## Dependency Watchdog
+
+Gardenlet can deploy two instances of the [dependency-watchdog](https://github.com/gardener/dependency-watchdog) into the `garden` namespace of the seed cluster — one for the weeder and one for the prober.
+
+### Weeder
+
+The weeder alleviates delays where control plane components remain unavailable by restarting pods in `CrashLoopBackoff` once their dependencies become ready. For example, when `etcd` goes down, `kube-apiserver` also goes down. Without the weeder, after `etcd` recovers, the `kube-apiserver` may not restart promptly. The weeder detects this situation and restarts the affected pods.
+
+```yaml
+spec:
+  settings:
+    dependencyWatchdog:
+      weeder:
+        enabled: true  # default: true
+```
+
+<Warning>
+The field `.spec.settings.dependencyWatchdog.endpoint.enabled` is deprecated and will be removed in a future version. Use `.spec.settings.dependencyWatchdog.weeder.enabled` instead.
+</Warning>
+
+### Prober
+
+The prober scales down `kube-controller-manager` of shoot clusters when their `kube-apiserver` is not reachable via its external ingress. This prevents melt-down situations: the `kube-controller-manager` uses in-cluster communication, so it wouldn't know about external connectivity issues. Worker nodes use the external ingress, so without scaling down `kube-controller-manager`, nodes may be incorrectly marked `NotReady` and eventually replaced. As a precaution, `machine-controller-manager` and `cluster-autoscaler` are also scaled down.
+
+```yaml
+spec:
+  settings:
+    dependencyWatchdog:
+      prober:
+        enabled: true  # default: true
+```
+
+<Warning>
+The field `.spec.settings.dependencyWatchdog.probe.enabled` is deprecated. Use `.spec.settings.dependencyWatchdog.prober.enabled` instead.
+</Warning>
+
+---
+
+## Excess Capacity Reservation
+
+When enabled, gardenlet deploys a special low-priority `Deployment` of `pause` containers into the `garden` namespace. These pods use real cluster capacity but are immediately preempted when real workloads (like new shoot control planes) need to be scheduled. This eliminates scale-up delays when new shoots are created on a near-capacity seed.
+
+The workflow:
+1. `pause` pods occupy capacity at low priority
+2. A new shoot's control plane pods are created → they preempt the `pause` pods
+3. `pause` pods need to reschedule → cluster-autoscaler triggers scale-up
+4. The shoot control plane is already running without waiting for nodes to join
+
+```yaml
+spec:
+  settings:
+    excessCapacityReservation:
+      enabled: true  # default: true when configs are present
+      configs:
+      - resources:
+          requests:
+            cpu: "2"
+            memory: 6Gi
+        # nodeSelector: {}   # optional
+        # tolerations: []    # optional
+```
+
+- Each config entry creates a `Deployment` with a **minimum of 2 replicas** and a **maximum equal to the number of zones** configured for the seed
+- The default config reserves **2 CPUs and 6Gi memory** per pod, with no `nodeSelector` or `tolerations`
+- Disable by setting `.spec.settings.excessCapacityReservation.enabled: false`
+
+---
+
+## Scheduling
+
+By default, the Gardener Scheduler considers all seed clusters when placing a new shoot. Seeds can be excluded from automatic scheduling by marking them as invisible. Invisible seeds are ignored by the scheduler but can still be targeted explicitly via `.spec.seedName` in the `Shoot` resource.
+
+```yaml
+spec:
+  settings:
+    scheduling:
+      visible: true  # default: true; set to false to hide from scheduler
+```
+
+<Note>
+In Gardener versions before 1.5, this behavior was controlled via taint keys (`seed.gardener.cloud/disable-capacity-reservation`, `seed.gardener.cloud/invisible`). Those taint keys were removed in version 1.12.
+</Note>
+
+---
+
+## Load Balancer Services
+
+Gardener creates `Service` objects of type `LoadBalancer` in the seed cluster to expose shoot control planes (primarily `kube-apiserver` endpoints). The following settings control how these load balancers are created.
+
+### Annotations
+
+Inject custom annotations into all `LoadBalancer` `Service`s created by Gardener in this seed:
+
+```yaml
+spec:
+  settings:
+    loadBalancerServices:
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+        service.beta.kubernetes.io/aws-load-balancer-type: nlb
+```
+
+### Load Balancer Class
+
+By default, `Service`s are created without `spec.loadBalancerClass`, using the cloud infrastructure's default load balancer. To use a non-default implementation:
+
+```yaml
+spec:
+  settings:
+    loadBalancerServices:
+      loadBalancerClass: my-custom-lb-class
+```
+
+<Warning>
+Kubernetes does not allow changing `spec.loadBalancerClass` on existing `Service`s. This setting only applies to **newly created** load balancer services. Migrating existing services requires manual operator intervention.
+</Warning>
+
+### External Traffic Policy
+
+<Tabs>
+  <Tab title="Cluster (Default)">
+    Traffic is routed to any cluster node, which then redirects to the receiving pod. This adds one hop, may cross zone boundaries twice, and replaces the client source IP with a node IP.
+
+    ```yaml
+    spec:
+      settings:
+        loadBalancerServices:
+          externalTrafficPolicy: Cluster
+    ```
+  </Tab>
+  <Tab title="Local">
+    Traffic is routed directly to nodes running the backend pod. Benefits:
+    - Preserves client source IP
+    - Removes one hop from the data path
+    - Reduces request latency
+    - Can be combined with annotations to prevent cross-zonal traffic
+
+    Implications to consider:
+    - Health checks are exposed by `kube-proxy`; if `kube-proxy` is not working on a node, that node's pods won't receive load balancer traffic
+    - Load balancing may become imbalanced when multiple pods share a node (load balancers split load by node, not pod)
+
+    ```yaml
+    spec:
+      settings:
+        loadBalancerServices:
+          externalTrafficPolicy: Local
+    ```
+  </Tab>
+</Tabs>
+
+### Proxy Protocol
+
+For level 3 load balancers, proxy protocol is the standard way to preserve client IP addresses. It prepends a small header before the actual workload data, so the receiving server must be configured to handle it.
+
+For disruption-free migration to proxy protocol, set `allow: true` first, then enable proxy protocol on the load balancer:
+
+```yaml
+spec:
+  settings:
+    loadBalancerServices:
+      proxyProtocol:
+        allow: true
+```
+
+When switching **off** proxy protocol, reverse the order: disable it on the load balancer first, then set `allow: false`.
+
+### Zonal Ingress
+
+By default, Gardener deploys Istio ingress gateways in **each availability zone** of a seed to reduce cross-zonal traffic for single-zone shoot control planes.
+
+```yaml
+spec:
+  settings:
+    loadBalancerServices:
+      zonalIngress:
+        enabled: true  # default: true
+```
+
+To minimize the number of load balancers (e.g., to reduce infrastructure costs when cross-zonal traffic is acceptable), disable zonal ingress:
+
+```yaml
+spec:
+  settings:
+    loadBalancerServices:
+      zonalIngress:
+        enabled: false
+```
+
+**Migration guide to disable zonal ingress**:
+
+<Steps>
+  <Step title="Disable the setting">
+    Set `.spec.settings.loadBalancerServices.zonalIngress.enabled=false` in the `Seed` specification.
+  </Step>
+  <Step title="Wait for all shoots to reconcile">
+    During reconciliation, single-zone shoots update their `Gateway` resources to use the default gateway.
+  </Step>
+  <Step title="Zonal gateways are cleaned up automatically">
+    Once all shoot `Gateway` resources no longer reference the zonal ingress gateways, they are automatically removed.
+  </Step>
+</Steps>
+
+<Warning>
+Expect **temporary unavailability** of shoot control planes when disabling zonal ingress. DNS entries are updated to point to the default gateway, but clients may use cached DNS entries pointing to zonal gateways for up to the configured DNS TTL. Long-running connections will also be interrupted. Schedule this change during a maintenance window.
+</Warning>
+
+### Zone-Specific Load Balancer Settings
+
+For seeds spanning multiple zones (`.spec.provider.zones`), you can configure per-zone load balancer behavior:
+
+```yaml
+spec:
+  settings:
+    loadBalancerServices:
+      zones:
+      - name: eu-central-1a
+        annotations:
+          service.beta.kubernetes.io/aws-load-balancer-subnets: "subnet-abc123"
+        externalTrafficPolicy: Local
+        proxyProtocol:
+          allow: true
+      - name: eu-central-1b
+        annotations:
+          service.beta.kubernetes.io/aws-load-balancer-subnets: "subnet-def456"
+```
+
+---
+
+## Vertical Pod Autoscaler
+
+Gardener heavily relies on the [Kubernetes VPA component](https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler). By default, the seed controller deploys VPA components into the `garden` namespace of each seed cluster.
+
+If you want to manage VPA yourself (e.g., you have a custom VPA or want to avoid running two VPA instances), disable Gardener's automatic deployment:
+
+```yaml
+spec:
+  settings:
+    verticalPodAutoscaler:
+      enabled: false  # default: true
+```
+
+<Warning>
+A VPA **must always be present** for your seed cluster. Running a seed without VPA is not supported, regardless of this setting. If you disable Gardener's VPA, you are responsible for deploying and managing your own.
+</Warning>
+
+### VPA Pitfall: Unschedulable Pods
+
+VPA is unaware of node capacity and can recommend resource requests exceeding any single node's allocatable capacity. To prevent permanently unschedulable pods:
+
+1. Use `VerticalPodAutoscaler.Spec.ResourcePolicy.ContainerPolicies[].MaxAllowed` to cap requests at node allocatable capacity
+2. Maintain worker pools with capacity to accommodate VPA's highest recommended requests
+3. The optimal strategy combines both: large enough worker pools plus `MaxAllowed` constraints aligned with the largest worker's allocatable resources
+
+---
+
+## Zone Selection
+
+Zone selection controls which availability zone is used for shoot control plane namespaces in the seed cluster.
+
+<Note>
+Zone selection only affects **non-HA shoots** and **HA shoots with failure tolerance type `node`** — cases where the control plane runs in a single zone. HA shoots with failure tolerance type `zone` spread across multiple zones by definition and are unaffected.
+</Note>
+
+By default, Gardener randomly selects a zone from `.spec.provider.zones[]`. For operators with multi-AZ seeds and single-zone shoots, zone selection allows the control plane to co-locate with the shoot's worker nodes, minimizing cross-zonal traffic.
+
+<Warning>
+Zone assignment only happens during shoot **creation** or when the shoot is **restored** on a new seed. Adding or changing worker zones after creation does not change the control plane zone.
+</Warning>
+
+### Mode: Prefer
+
+Gardener attempts to match the shoot's worker zones to the seed's available zones. If there is an intersection, those matching zones are used. If not, Gardener falls back to random selection.
+
+```yaml
+spec:
+  settings:
+    zoneSelection:
+      mode: Prefer
+```
+
+- **Single-zone shoot** (worker in `eu-central-1a`, seed has `[eu-central-1a, eu-central-1b, eu-central-1c]`) → control plane pinned to `eu-central-1a`
+- **No overlap** (workers in `[us-east-1a]`, seed has `[eu-central-1a, eu-central-1b]`) → falls back to random selection; scheduling still succeeds
+
+This mode never causes scheduling failures — safe to enable broadly.
+
+### Mode: Enforce
+
+Gardener **requires** at least one of the shoot's worker zones to be present in the seed's zone list. If no intersection exists, control plane reconciliation fails.
+
+```yaml
+spec:
+  settings:
+    zoneSelection:
+      mode: Enforce
+```
+
+- **Single-zone shoot** (worker in `eu-central-1a`, seed has `[eu-central-1a, eu-central-1b]`) → control plane pinned to `eu-central-1a`
+- **No overlap** (workers in `[eu-central-1a]`, seed has `[eu-central-1b, eu-central-1c]`) → scheduler excludes this seed; if no compatible seed is found, scheduling fails
+
+---
+
+## Topology-Aware Traffic Routing
+
+The topology-aware routing setting for seeds controls whether Gardener configures `TopologyAwareHints` on services in the seed cluster to reduce cross-zonal traffic. This setting controls whether Gardener configures `TopologyAwareHints` on services in the seed cluster to reduce cross-zonal traffic.
+
+---
+
+## Emergency: Temporarily Disabling Shoot Reconciliations
+
+In emergency situations, you can stop all shoot reconciliations in a seed cluster to prevent faulty updates from propagating or to stop gardenlet from performing unintended actions.
+
+```bash
+# Disable reconciliations for a single seed
+kubectl annotate seed <seed-name> \
+  shoot.gardener.cloud/emergency-stop-reconciliations=true
+
+# Disable reconciliations for ALL seeds at once
+kubectl annotate seed --all \
+  shoot.gardener.cloud/emergency-stop-reconciliations=true
+```
+
+While this annotation is present:
+- The `Shoot` controller will not reconcile any `Shoot` clusters in the affected seed
+- New `Shoot` clusters will not be scheduled to this seed
+- The `Seed` will expose the `SeedDisabledShootReconciliations` condition
+
+<Warning>
+This mechanism is for **exceptional cases only** and should not be used in regular operations. It can have significant implications for cluster health and update consistency.
+</Warning>
+
+When the annotation is removed, reconciliation resumes — but shoots are **not** immediately reconciled. They will be reconciled during their next scheduled reconciliation window. If you need immediate reconciliation after re-enabling, trigger it manually on each shoot.

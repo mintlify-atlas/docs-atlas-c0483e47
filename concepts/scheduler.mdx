@@ -1,0 +1,132 @@
+---
+title: "Gardener Scheduler: Shoot-to-Seed Assignment"
+description: "Learn how the Gardener Scheduler assigns shoots to seeds using SameRegion or MinimalDistance strategies, and how filtering and capacity enforcement work."
+---
+
+The Gardener Scheduler is a controller that watches newly created shoot clusters and assigns each one to an appropriate seed cluster. Conceptually, this mirrors the role of the Kubernetes scheduler — finding a seed for a shoot instead of a node for a pod. Like its Kubernetes counterpart, the Gardener Scheduler is a standalone component, deliberately decoupled from the API server to allow independent development and extension.
+
+Previously, scheduling decisions were made by an admission plugin inside the `gardener-apiserver`. Moving this logic to a separate component enables greater flexibility: scheduling behavior can be adjusted without modifying the API server, and it opens the door to custom scheduler implementations.
+
+## How scheduling works
+
+When a shoot is created without a `.spec.seedName`, the scheduler processes it through the following sequence:
+
+<Steps>
+  <Step title="Determine usable seeds">
+    A seed is considered usable when all of the following are true:
+    - No `.metadata.deletionTimestamp` is set
+    - `.spec.settings.scheduling.visible` is `true`
+    - `.status.lastOperation` is not `nil`
+    - Conditions `GardenletReady` and `BackupBucketsReady` (if applicable) are `True`
+  </Step>
+  <Step title="Filter seeds">
+    The candidate pool is narrowed by:
+    - Matching `.spec.seedSelector` in the `CloudProfile` referenced by the shoot
+    - Matching `.spec.seedSelector` in the shoot itself
+    - No network overlap with the shoot's networks (VPN connectivity requires disjoint CIDRs)
+    - Taints (`.spec.taints`) tolerated by the shoot's `.spec.tolerations`
+    - Access restrictions (`.spec.accessRestrictions`) supported by the seed
+    - Available capacity — the seed's `allocatable` shoot count must not be exceeded
+    - At least three zones if the shoot requests high-availability control plane with `zone` failure tolerance
+    - Zone list compatibility with the shoot's worker pool zones (enforced or preferred depending on the seed's zone selection mode)
+  </Step>
+  <Step title="Apply scheduling strategy">
+    The active strategy (configured in `candidateDeterminationStrategy`) further narrows or ranks candidates. See the [strategies section](#strategies) below.
+  </Step>
+  <Step title="Select least utilized seed">
+    Among remaining candidates, the seed with the fewest shoot control planes is chosen and written to `.spec.seedName` on the `Shoot` resource. The gardenlet for that seed then picks up the shoot and creates the cluster.
+  </Step>
+</Steps>
+
+## Strategies
+
+The scheduling strategy is set via `candidateDeterminationStrategy` in the scheduler's component configuration.
+
+<Tabs>
+  <Tab title="SameRegion (default)">
+    The scheduler reads `.spec.provider.type` and `.spec.region` from the shoot and looks for a seed with identical values in its own `.spec.provider.type` and `.spec.provider.region`.
+
+    If no matching seed exists, the shoot remains unschedulable and an event is recorded.
+  </Tab>
+  <Tab title="MinimalDistance">
+    The scheduler finds the seed with the minimum configured distance to the shoot's intended region. Distances are defined per cloud provider in `ConfigMap`s stored in the `garden` namespace:
+
+    ```yaml
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: region-distances
+      namespace: garden
+      annotations:
+        scheduling.gardener.cloud/cloudprofiles: cloudprofile-name-1
+      labels:
+        scheduling.gardener.cloud/purpose: region-config
+    data:
+      eu-west-1: |
+        eu-central-1: 10
+        us-east-1: 80
+      eu-central-1: |
+        eu-west-1: 10
+        us-east-1: 90
+    ```
+
+    If a `CloudProfile` is referenced by multiple `ConfigMap`s, only the first one is used. If no distance configuration exists for the shoot's region, the scheduler falls back to a Levenshtein distance calculation on region names, splitting names into a base and an orientation (`north`, `south`, `east`, `west`, `central`). A matching provider and orientation is always preferred.
+  </Tab>
+</Tabs>
+
+### Testing purpose override
+
+Shoots with `purpose: testing` are handled specially: the scheduler only matches on `.spec.provider.type` and ignores region entirely. This allows testing shoots to be scheduled to any seed with a matching provider, improving load distribution across the landscape.
+
+## Seed capacity enforcement
+
+Seeds have a practical limit for how many shoots they can accommodate. The gardenlet reports resource capacity and allocatable amounts in the `Seed` status:
+
+- **Capacity**: Total configured maximum (from the gardenlet's component configuration).
+- **Allocatable**: Capacity minus the amount reserved for Gardener's own use.
+
+The scheduler excludes any seed whose `allocatable` shoot count would be exceeded if the shoot were scheduled there.
+
+## Configuration reference
+
+The scheduler requires a configuration file on startup — there are no other flags. A full example is available in the Gardener repository at `example/20-componentconfig-gardener-scheduler.yaml`. Key settings:
+
+- `candidateDeterminationStrategy`: `SameRegion` (default) or `MinimalDistance`
+- Standard client connection and leader election settings (same as other Gardener components)
+
+<Note>
+The Gardener Scheduler does not expose any webhooks, so no TLS configuration is required.
+</Note>
+
+## Manual seed assignment
+
+You can bypass the scheduler entirely by pre-setting `.spec.seedName` on a shoot at creation time. This requires RBAC permission on the `shoots/binding` subresource — regular end-users do not have this permission.
+
+If a different seed is already assigned to a shoot and you update `.spec.seedName`, this triggers a **control plane migration**. See the control plane migration documentation for the required steps.
+
+## Custom scheduler support
+
+Similar to the `.spec.schedulerName` field on Kubernetes `Pod`s, the `Shoot` specification has an optional `.spec.schedulerName` field. If set, only the scheduler with that name processes the shoot. The name `default-scheduler` is reserved for the built-in Gardener scheduler. Shoots referencing a non-existent scheduler name remain in `Pending` state indefinitely.
+
+## Seed selector
+
+The `.spec.seedSelector` field on a shoot allows users to further restrict which seeds are eligible, using a label selector:
+
+```yaml
+spec:
+  seedSelector:
+    matchLabels:
+      environment: production
+    providerTypes:
+    - aws
+    - azure
+```
+
+The `providerTypes` field within `seedSelector` allows specifying which provider types are acceptable (use `*` to allow all). By default, only seeds matching the shoot's own provider type are considered.
+
+## Failure handling
+
+If no suitable seed can be found, the scheduler retries with exponential backoff. The failure reason is reported in:
+
+- `.status.lastOperation` on the `Shoot` resource
+- A Kubernetes event retrievable via `kubectl -n <namespace> describe shoot <name>`

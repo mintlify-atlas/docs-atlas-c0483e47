@@ -1,0 +1,194 @@
+---
+title: "Gardener Operator: Garden Cluster Management"
+description: "Learn how gardener-operator bootstraps the virtual garden cluster, manages etcd and kube-apiserver, and reconciles the Garden resource."
+---
+
+The `gardener-operator` is responsible for the entire garden cluster environment. Without it, operators must deploy etcd, the Gardener control plane, and related infrastructure manually using separate tooling and processes. The gardener-operator re-uses the same production-grade mechanisms Gardener applies to seed and shoot clusters, applying them to manage the garden cluster itself.
+
+There is a Helm chart available to deploy the `gardener-operator`. Once it is running, you create a single `Garden` resource to declare the desired state of the garden environment. Only one `Garden` resource can exist per system at a time.
+
+## The Garden resource
+
+The `Garden` resource is the central configuration object that drives `gardener-operator`. It is split into configuration for two distinct cluster layers:
+
+<CardGroup cols={2}>
+  <Card title="Runtime cluster" icon="server">
+    The Kubernetes cluster where `gardener-operator` runs and where all garden system components are deployed as pods. This cluster hosts the virtual garden's control plane.
+  </Card>
+  <Card title="Virtual garden cluster" icon="cloud">
+    The logical Kubernetes cluster exposed via `virtual-garden-kube-apiserver`. This is the cluster users interact with to create `Project`s, `Shoot`s, and other Gardener resources.
+  </Card>
+</CardGroup>
+
+### Runtime cluster settings
+
+The `.spec.runtimeCluster.settings` section controls `gardener-operator`'s behavior in the runtime cluster:
+
+**Load balancer services**: `gardener-operator` deploys Istio to expose the `virtual-garden-kube-apiserver`. You can inject custom annotations into the resulting `LoadBalancer` services via `.spec.runtimeCluster.settings.loadBalancerServices.annotations`.
+
+**Vertical Pod Autoscaler**: The operator relies heavily on VPA. By default, it deploys VPA components into the `garden` namespace. If you manage VPA yourself, set `.spec.runtimeCluster.settings.verticalPodAutoscaler.enabled=false` to prevent duplicate deployments.
+
+<Warning>
+A VPA must always be available for the runtime cluster. Running without VPA is not supported.
+</Warning>
+
+**Volume sizes**: Set `.spec.runtimeCluster.volume.minimumSize` to enforce a minimum `PersistentVolumeClaim` size, which is required on some infrastructure providers.
+
+### Virtual cluster settings
+
+The virtual garden cluster version is controlled via `.spec.virtualCluster.kubernetes.version`. Specific control plane component configuration is provided under `.spec.virtualCluster.kubernetes.kubeAPIServer`, `.spec.virtualCluster.kubernetes.kubeControllerManager`, etc.
+
+**DNS**: At least one DNS domain must be provided via `.spec.virtualCluster.dns.domains`. DNS records are not managed by `gardener-operator` — create them manually pointing to the `istio-ingressgateway` service load balancer in the `virtual-garden-istio-ingress` namespace. Records must be prefixed with both `gardener.` and `api.` for all configured domains.
+
+**ETCD encryption**: You can customize encryption configuration for the virtual `kube-apiserver` via `.spec.virtualCluster.kubernetes.kubeAPIServer.encryptionConfig` and for `gardener-apiserver` via `.spec.virtualCluster.gardener.gardenerAPIServer.encryptionConfig`. The following resources are always encrypted by the `gardener-apiserver`:
+
+- `controllerdeployments.core.gardener.cloud`
+- `controllerregistrations.core.gardener.cloud`
+- `internalsecrets.core.gardener.cloud`
+- `shootstates.core.gardener.cloud`
+
+## Bootstrap sequence
+
+The `Garden` controller's main reconciler follows this sequence to bring up the virtual garden:
+
+<Steps>
+  <Step title="Generate CA certificate">
+    A general CA certificate valid for approximately 30 days is generated and auto-rotated when 80% of its lifetime is reached.
+  </Step>
+  <Step title="Deploy garden system components">
+    The `gardener-resource-manager` is deployed first. It then manages the remaining system components via its `ManagedResource` controller:
+    - `PriorityClass`es for workload resources
+    - RBAC rules for the virtual garden
+    - Vertical Pod Autoscaler (if enabled)
+    - ETCD Druid
+    - Istio
+  </Step>
+  <Step title="Deploy virtual garden ETCDs">
+    Two etcd instances are deployed via ETCD Druid using `druid.gardener.cloud/v1alpha1.Etcd` resources:
+    - `virtual-garden-etcd-main`
+    - `virtual-garden-etcd-events`
+  </Step>
+  <Step title="Deploy virtual garden control plane">
+    The following control plane components are brought up:
+    - `virtual-garden-kube-apiserver`
+    - `virtual-garden-kube-controller-manager`
+    - `virtual-garden-gardener-resource-manager`
+
+    The `kube-apiserver` is exposed via Istio in the same way shoot cluster API servers are exposed. If `.spec.virtualCluster.controlPlane.highAvailability={}` is set, all components run in HA mode (3 etcd replicas, multiple API server replicas spread across zones).
+  </Step>
+  <Step title="Deploy Gardener control plane">
+    The Gardener control plane components are deployed:
+    - `gardener-apiserver`
+    - `gardener-admission-controller`
+    - `gardener-controller-manager`
+    - `gardener-scheduler`
+
+    The `gardener-apiserver` reuses the same ETCDs as the `virtual-garden-kube-apiserver`, keeping all garden cluster data together and simplifying backup and restore.
+  </Step>
+</Steps>
+
+<Note>
+The `kube-controller-manager` for the virtual garden does not enable the `serviceaccount-token` controller. Static `ServiceAccount` secrets are not supported. Use the `TokenRequest` API instead, or leverage the `gardener-resource-manager`'s `TokenRequestor` controller.
+</Note>
+
+## Observability components
+
+`gardener-operator` deploys a full observability stack into the `garden` namespace:
+
+<AccordionGroup>
+  <Accordion title="Garden Prometheus">
+    Fetches metrics from garden system components, cAdvisors, the virtual cluster control plane, and seed aggregate Prometheus instances. It serves as both an operator debugging entrypoint and the top-level metering aggregator across the Gardener landscape.
+
+    To extend Garden Prometheus, create `prometheus-operator` custom resources labeled with `prometheus=garden`:
+
+    ```yaml
+    apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      labels:
+        prometheus: garden
+      name: garden-my-component
+      namespace: garden
+    spec:
+      selector:
+        matchLabels:
+          app: my-component
+      endpoints:
+      - port: metrics
+    ```
+  </Accordion>
+  <Accordion title="Long-Term Prometheus">
+    Federates metrics from Garden Prometheus for longer retention. It includes a Cortex sidecar for query caching. To extend it, create `prometheus-operator` resources labeled with `prometheus=longterm`.
+  </Accordion>
+  <Accordion title="Alertmanager">
+    The `alertmanager-garden` instance ships without default configuration. Create `AlertmanagerConfig` resources labeled with `alertmanager=garden` to configure routing and receivers:
+
+    ```yaml
+    apiVersion: monitoring.coreos.com/v1alpha1
+    kind: AlertmanagerConfig
+    metadata:
+      name: config
+      namespace: garden
+      labels:
+        alertmanager: garden
+    spec:
+      route:
+        receiver: dev-null
+        groupBy: [alertname, landscape]
+    ```
+  </Accordion>
+  <Accordion title="Plutono">
+    A Plutono instance is deployed for dashboard visualization. To add custom dashboards, create a `ConfigMap` in the `garden` namespace labeled with `dashboard.monitoring.gardener.cloud/garden=true` containing the dashboard JSON.
+  </Accordion>
+</AccordionGroup>
+
+Additional observability components deployed include: `fluent-operator`, `fluent-bit`, `gardener-metrics-exporter`, `kube-state-metrics`, `prometheus-operator`, `opentelemetry-operator`, `perses-operator`, and `victoria-operator`.
+
+## Extension management
+
+The `Extension` resource automates the installation and lifecycle of Gardener extensions. It manages:
+
+- Extension chart deployment in the runtime cluster
+- `ControllerRegistration` and `ControllerDeployment` resources in the virtual garden cluster
+- Extension admission webhook deployments in both clusters
+
+Extensions of type `BackupBucket`, `DNSRecord`, and `Extension` are particularly important during `Garden` reconciliation, as they manage backup buckets, DNS records for the API server, and generic Gardener extension components.
+
+## Using the runtime cluster as a seed cluster
+
+In development or evaluation scenarios, the runtime cluster can also act as a seed cluster. When `gardenlet` detects that its seed cluster is the garden runtime cluster, it skips managing components already handled by `gardener-operator`:
+
+- `gardener-resource-manager`
+- `vpa-{admission-controller,recommender,updater}`
+- `etcd-druid`
+- Istio control plane
+- `nginx-ingress-controller`
+- Observability components (`fluent-operator`, `fluent-bit`, `vali`, `plutono`, etc.)
+
+<Warning>
+When the runtime cluster is also a seed cluster, you must upgrade `gardener-operator` and `gardenlet` in lockstep to prevent version mismatches.
+</Warning>
+
+## Credentials rotation
+
+Credentials rotation follows the same pattern as `Shoot` resources using `gardener.cloud/operation` annotation values. Certificate authorities are auto-rotated approximately monthly (`ca-garden-runtime`), but other CAs require manual rotation on demand.
+
+**It is the operator's responsibility to regularly rotate credentials.** The types of credentials managed by `gardener-operator` are:
+
+- Certificate authorities (and related server and client certificates)
+- ETCD encryption key
+- Observability password for Plutono
+- `ServiceAccount` token signing key
+- `WorkloadIdentity` token signing key
+
+When `ServiceAccount` token signing key rotation enters the `Preparing` phase, `gardener-operator` annotates all `Seed`s with `gardener.cloud/operation=renew-garden-access-secrets`, causing gardenlets to refresh their extension tokens. Similarly, CA rotation in `Preparing` phase triggers `gardener.cloud/operation=renew-kubeconfig` on all seeds, causing gardenlets to request new client certificates.
+
+## Webhooks
+
+`gardener-operator` exposes validation and defaulting webhooks for `Garden` and `Extension` resources. Key validations include:
+
+- **Deletion confirmation**: `Garden` resources can only be deleted when annotated with `confirmation.gardener.cloud/deletion=true`.
+- **Single Garden enforcement**: Only one `Garden` resource may exist in the system at a time.
+- **Audit policy validation**: References to audit policy `ConfigMap`s are validated to contain a valid `audit.k8s.io/v1.Policy`.
+- **Namespace protection**: The `garden` namespace cannot be deleted while a `Garden` resource exists.
+- **Extension immutability**: The `primary` field in `.spec.resources` of `Extension` resources is immutable after creation.

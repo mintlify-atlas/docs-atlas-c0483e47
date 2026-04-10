@@ -1,0 +1,221 @@
+---
+title: "Gardener Resource Manager: Resource Lifecycle Control"
+description: "How gardener-resource-manager enforces desired state via ManagedResource CRDs, performs health checks, garbage-collects resources, and injects tokens."
+---
+
+The `gardener-resource-manager` solves a fundamental challenge in Gardener: Kubernetes resources that Gardener deploys to seed and shoot clusters must stay in their desired state despite potential manual modifications by users or operators. Any drift — an accidentally deleted `ConfigMap`, a modified `Deployment` spec — can cascade into shoot, seed, or landscape failures.
+
+The resource manager addresses this by introducing the `ManagedResource` custom resource: a declaration of the desired state of a set of Kubernetes resources in a target cluster. It continuously reconciles those resources back to their desired state, while also providing webhook handlers, garbage collection, token management, and network policy automation.
+
+It is deployed by the gardenlet **once per seed** (in the `garden` namespace) and **once per shoot** (in the shoot's control plane namespace in the seed).
+
+## ManagedResource controller
+
+The `ManagedResource` controller watches `resources.gardener.cloud/v1alpha1.ManagedResource` objects. Each `ManagedResource` references one or more `Secret`s, each containing encoded Kubernetes manifests.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: managedresource-example1
+  namespace: default
+type: Opaque
+data:
+  objects.yaml: <base64-encoded-manifests>
+    # apiVersion: v1
+    # kind: ConfigMap
+    # metadata:
+    #   name: test-1234
+    #   namespace: default
+---
+apiVersion: resources.gardener.cloud/v1alpha1
+kind: ManagedResource
+metadata:
+  name: example
+  namespace: default
+spec:
+  secretRefs:
+  - name: managedresource-example1
+```
+
+When a user modifies the managed `ConfigMap`, the controller reconciles it back to the desired state stored in the secret. Labels can also be injected into all managed resources using the `injectLabels` field.
+
+### Conditions
+
+Every `ManagedResource` exposes three status conditions:
+
+| Condition              | Description                                               |
+|------------------------|-----------------------------------------------------------|
+| `ResourcesApplied`     | `True` if all resources are applied to the target cluster |
+| `ResourcesHealthy`     | `True` if all resources are present and healthy           |
+| `ResourcesProgressing` | `False` if all resources have been fully rolled out       |
+
+A healthy `ManagedResource` looks like:
+
+```yaml
+conditions:
+- type: ResourcesHealthy
+  status: "True"
+  reason: ResourcesHealthy
+  message: All resources are healthy.
+- type: ResourcesProgressing
+  status: "False"
+  reason: ResourcesRolledOut
+  message: All resources have been fully rolled out.
+- type: ResourcesApplied
+  status: "True"
+  reason: ApplySucceeded
+  message: All resources are applied.
+```
+
+### Preventing reconciliation
+
+Annotate a `ManagedResource` with `resources.gardener.cloud/ignore=true` to skip all reconciliation and deletion of its managed resources. This is useful for temporarily patching managed resources. Note: when the `ManagedResource` itself is deleted (e.g., during shoot deletion), this annotation is not respected.
+
+### Preserving replicas and resources
+
+Annotate individual resources within a `ManagedResource` secret to preserve certain fields:
+
+- `resources.gardener.cloud/preserve-replicas=true`: Preserves `.spec.replicas` during updates.
+- `resources.gardener.cloud/preserve-resources=true`: Preserves container resource requests/limits.
+
+Standard `HorizontalPodAutoscaler` and `VerticalPodAutoscaler` resources are auto-detected and handled without these annotations.
+
+### Resource class and scope
+
+By default, the resource manager watches `ManagedResource`s in all namespaces. The `.sourceClientConnection.namespace` field restricts the watch to a single namespace. The optional `.spec.class` field on a `ManagedResource` allows the resource manager to handle only resources of a specific class — used to route resources to the correct resource manager instance (seed vs. shoot).
+
+### Manifest compression
+
+For large `ManagedResource`s, secrets can store manifests in Brotli-compressed format. Files with the `.br` suffix are automatically decompressed before processing. To inspect a compressed secret:
+
+```bash
+kubectl -n <namespace> get secret <secret-name> \
+  -o jsonpath='{.data.data\.yaml\.br}' | base64 -d | brotli -d
+```
+
+## Health controller
+
+The health controller runs after the `ManagedResource` controller has applied resources at least once. It performs ongoing health and rollout-progress checks.
+
+**Progressing checks** detect in-progress rollouts for: `DaemonSet`, `Deployment`, `StatefulSet`, `Prometheus`, `Alertmanager`, `Certificate`, and `Issuer`.
+
+**Health checks** evaluate the health of: `CustomResourceDefinition`, `DaemonSet`, `Deployment`, `Job`, `Pod`, `ReplicaSet`, `ReplicationController`, `Service`, `StatefulSet`, `VerticalPodAutoscaler`, `Prometheus`, `Alertmanager`, `Certificate`, and `Issuer`.
+
+To skip health checks for a specific resource, annotate it with `resources.gardener.cloud/skip-health-check=true`.
+
+## Garbage collector for immutable ConfigMaps and Secrets
+
+Immutable `ConfigMap`s and `Secret`s require unique names, which means old versions accumulate over time. The optional garbage collector controller (disabled by default) cleans them up.
+
+The GC controller scans resources labeled with `resources.gardener.cloud/garbage-collectable-reference=true` and checks all workload resources for `reference.resources.gardener.cloud/{configmap,secret}-<hash>=<name>` annotations. Resources not referenced by any workload are deleted.
+
+**Example:**
+
+```yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-5678
+  namespace: default
+  labels:
+    resources.gardener.cloud/garbage-collectable-reference: "true"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: example
+  namespace: default
+  annotations:
+    reference.resources.gardener.cloud/configmap-82a3537f: test-5678
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.14.2
+```
+
+In this example, `test-1234` would be garbage-collected if no workload references it, while `test-5678` is preserved.
+
+<Tip>
+Annotate workload templates (`.spec.template.metadata.annotations`) as well as top-level metadata, so the GC controller does not consider resources "unused" just because no pods are currently running (e.g., a `Deployment` scaled to 0).
+</Tip>
+
+Enable the GC controller by setting `.controllers.garbageCollector.enabled=true` in the component configuration.
+
+## TokenRequestor controller
+
+The `TokenRequestor` controller issues short-lived tokens via the `TokenRequest` API and populates them into `Secret`s. It solves the cross-cluster token problem: components running in the seed that need to communicate with a shoot cluster cannot use native `ServiceAccount` volume projection (which only issues tokens for the local cluster).
+
+The controller watches `Secret`s labeled with `resources.gardener.cloud/purpose=token-requestor`. For each such secret, it:
+
+1. Ensures a `ServiceAccount` exists in the **target cluster** (specified by annotations on the secret).
+2. Issues a token for that `ServiceAccount` via the `TokenRequest` API.
+3. Writes the token into the secret's `.data.token` field (or into the token field of a kubeconfig at `.data.kubeconfig`).
+4. Renews the token when 80% of its lifetime has elapsed, or after 24 hours at most.
+
+```yaml
+# Annotations on the Secret in the source cluster
+serviceaccount.resources.gardener.cloud/name: <sa-name>
+serviceaccount.resources.gardener.cloud/namespace: <sa-namespace>
+serviceaccount.resources.gardener.cloud/token-expiration-duration: 12h
+```
+
+Default token expiration is 12 hours.
+
+## NetworkPolicy controller
+
+The `NetworkPolicy` controller automates network policy management. Rather than requiring components to write their own `NetworkPolicy` resources, the controller generates them automatically based on `Service` definitions.
+
+For each port on a `Service` with a non-empty `.spec.podSelector`, the controller creates ingress and egress `NetworkPolicy`s. Components that need to communicate with the service simply add a label:
+
+```
+networking.resources.gardener.cloud/to-<service-name>-tcp-<port>=allowed
+```
+
+**Cross-namespace communication** is handled by annotating the `Service` with:
+
+```
+networking.resources.gardener.cloud/namespace-selectors='[{"matchLabels":{"kubernetes.io/metadata.name":"other-namespace"}}]'
+```
+
+**Wildcard namespace aliases** are supported via the `networking.resources.gardener.cloud/pod-label-selector-namespace-alias` annotation, allowing a single label to grant access to the same service in multiple namespaces (used for `kube-apiserver` and `istio-ingressgateway` services).
+
+## Webhooks
+
+### High availability config
+
+This webhook ensures components deployed to seed or shoot clusters are configured for high availability. It reacts to `Deployment`s, `StatefulSet`s, and `HorizontalPodAutoscaler`s in namespaces labeled with `high-availability-config.resources.gardener.cloud/consider=true`.
+
+The webhook:
+1. Adjusts `.spec.replicas` based on the component type label and namespace failure tolerance annotation.
+2. Adds `NodeAffinity` to pin pods to specific zones when zone information is provided.
+3. Adds `TopologySpreadConstraints` to spread pods across nodes and zones.
+4. Adds default tolerations for `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` taints.
+
+### Auto-mounting projected ServiceAccount tokens
+
+When activated, this webhook automatically injects projected `ServiceAccount` token volumes into pods. It applies when:
+
+- The pod is not labeled with `projected-token-mount.resources.gardener.cloud/skip=true`
+- `.spec.serviceAccountName` is set and not `default`
+- The referenced `ServiceAccount` has `.automountServiceAccountToken=false`
+- No existing `kube-api-access-*` volume is present
+
+The injected volume is mounted at `/var/run/secrets/kubernetes.io/serviceaccount` and defaults to a 12-hour expiration (overridable via annotation `projected-token-mount.resources.gardener.cloud/expiration-seconds`).
+
+### CertificateSigningRequest approver
+
+This controller auto-approves CSRs for two use cases:
+
+**Kubelet server certificates**: The `kube-controller-manager` cannot auto-approve kubelet serving CSRs (`kubernetes.io/kubelet-serving` signer). The resource manager fills this gap, approving CSRs when the username matches the node, the DNS/IP SANs match the node's addresses, and exactly one `Machine` corresponds to the node.
+
+**Gardener Node Agent certificates**: Approves CSRs with common names prefixed with `gardener.cloud:node-agent:machine:` for bootstrapping new nodes, renewing certificates, and migrating nodes from service account tokens to client certificates.
+
+### Additional webhooks
+
+- **Seccomp profile**: Adds `RuntimeDefault` seccomp profile to pods without an explicit profile.
+- **System components**: Applies node selectors and tolerations to system component pods in shoot clusters.
+- **Pod scheduler name**: Sets a custom scheduler name for pods in configured namespaces.
+- **Kubernetes service host injection**: Directly injects the API server's FQDN as `KUBERNETES_SERVICE_HOST`, avoiding the `apiserver-proxy` network hop.
+- **Deletion protection**: Prevents accidental deletion of extension `CustomResourceDefinition`s and custom resources without the `confirmation.gardener.cloud/deletion=true` annotation.

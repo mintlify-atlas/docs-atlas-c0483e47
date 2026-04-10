@@ -1,0 +1,451 @@
+---
+title: "Writing a Gardener Extension Controller"
+description: "Build a Gardener extension controller: reconcile loops, heartbeat, health checks, admission webhooks, ManagedResources, and naming conventions."
+---
+
+Writing a Gardener extension means implementing a Kubernetes controller that reconciles custom resources in the `extensions.gardener.cloud/v1alpha1` API group. Gardener creates these resources with a desired state; your controller acts on them and reports results back through the `.status` field. The Gardener project provides a rich Go library in `extensions/pkg/` that handles the generic parts, so you can focus on the provider-specific logic.
+
+## Project structure
+
+A typical extension controller project looks like this:
+
+```
+my-extension/
+├── charts/                  # Helm chart for deploying the controller
+│   └── my-extension/
+├── cmd/
+│   └── gardener-extension-my-provider/
+│       └── main.go          # Entry point, wires up controllers
+├── pkg/
+│   ├── controller/
+│   │   ├── infrastructure/  # Infrastructure controller
+│   │   │   ├── actuator.go  # Provider-specific logic
+│   │   │   └── add.go       # Registers controller with manager
+│   │   ├── worker/
+│   │   ├── controlplane/
+│   │   └── healthcheck/
+│   ├── webhook/             # Mutating webhooks for control plane
+│   └── admission/           # Validating admission webhook
+└── example/
+    └── extension.yaml       # Example Extension registration resource
+```
+
+## The reconcile loop pattern
+
+Most extension controllers follow a pattern where a generic `Reconciler` from the Gardener library delegates provider-specific work to an `Actuator` interface that you implement. This keeps the boilerplate (watching resources, managing finalizers, updating status, error handling) in the library while your code focuses on provider specifics.
+
+**Actuator interface example for Infrastructure:**
+
+```go
+package infrastructure
+
+import (
+    "context"
+
+    extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+    "github.com/gardener/gardener/extensions/pkg/controller/infrastructure"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+type actuator struct {
+    client client.Client
+}
+
+func NewActuator(client client.Client) infrastructure.Actuator {
+    return &actuator{client: client}
+}
+
+// Reconcile creates or updates infrastructure resources for the shoot.
+func (a *actuator) Reconcile(
+    ctx context.Context,
+    infra *extensionsv1alpha1.Infrastructure,
+    cluster *extensionscontroller.Cluster,
+) error {
+    // 1. Parse providerConfig from infra.Spec.ProviderConfig
+    // 2. Use credentials from infra.Spec.SecretRef
+    // 3. Create/update cloud resources (VPCs, subnets, etc.)
+    // 4. Write results to infra.Status.ProviderStatus
+    return nil
+}
+
+// Delete removes all infrastructure resources for the shoot.
+func (a *actuator) Delete(
+    ctx context.Context,
+    infra *extensionsv1alpha1.Infrastructure,
+    cluster *extensionscontroller.Cluster,
+) error {
+    // Clean up all cloud resources
+    return nil
+}
+
+// Migrate is called during control plane migration to the destination seed.
+func (a *actuator) Migrate(
+    ctx context.Context,
+    infra *extensionsv1alpha1.Infrastructure,
+    cluster *extensionscontroller.Cluster,
+) error {
+    // Remove finalizers without deleting cloud resources
+    return nil
+}
+
+// Restore restores infrastructure state during control plane migration.
+func (a *actuator) Restore(
+    ctx context.Context,
+    infra *extensionsv1alpha1.Infrastructure,
+    cluster *extensionscontroller.Cluster,
+) error {
+    // Restore from saved state
+    return nil
+}
+```
+
+**Registering the controller:**
+
+```go
+package infrastructure
+
+import (
+    "github.com/gardener/gardener/extensions/pkg/controller/infrastructure"
+    "sigs.k8s.io/controller-runtime/pkg/manager"
+)
+
+func AddToManager(mgr manager.Manager) error {
+    return infrastructure.Add(mgr, infrastructure.AddArgs{
+        Actuator:          NewActuator(mgr.GetClient()),
+        ControllerOptions: controller.Options{MaxConcurrentReconciles: 5},
+        Predicates:        infrastructure.DefaultPredicates(myProviderType),
+        Type:              myProviderType,
+    })
+}
+```
+
+## Using the extension library
+
+The Gardener extension library at `extensions/pkg/` provides controllers for all extension resource types. Key packages:
+
+<CardGroup cols={2}>
+  <Card title="extensions/pkg/controller/infrastructure" icon="server">
+    Generic infrastructure controller with `Actuator` and `ConfigValidator` interfaces.
+  </Card>
+  <Card title="extensions/pkg/controller/worker" icon="cpu">
+    Generic worker controller with helpers for `MachineClass` and `MachineDeployment` management.
+  </Card>
+  <Card title="extensions/pkg/controller/controlplane" icon="shield">
+    Generic control plane controller for deploying cloud-controller-managers and CSI drivers.
+  </Card>
+  <Card title="extensions/pkg/controller/healthcheck" icon="heart-pulse">
+    Generic health check controller with pluggable health check functions.
+  </Card>
+</CardGroup>
+
+## Reading the Cluster resource
+
+Extension controllers often need information beyond their specific CRD. Use the `Cluster` resource (always available in the shoot namespace before reconciliation) to access the `CloudProfile`, `Seed`, and `Shoot` manifests:
+
+```go
+import (
+    extensionscontroller "github.com/gardener/gardener/extensions/pkg/controller"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+func getCluster(ctx context.Context, c client.Client, namespace string) (*extensionscontroller.Cluster, error) {
+    cluster, err := extensionscontroller.GetCluster(ctx, c, namespace)
+    if err != nil {
+        return nil, err
+    }
+    return cluster, nil
+}
+```
+
+The `Cluster` object decoded by the library provides typed access to `CloudProfile`, `Seed`, and `Shoot`. Always check `.Shoot.Spec.Hibernation.Enabled` to know whether to scale down components.
+
+## Heartbeat controller
+
+Every extension controller must run a heartbeat controller. It periodically renews a `Lease` object named `gardener-extension-heartbeat` in the namespace where the controller is deployed. `gardenlet` checks this `Lease` when performing shoot health checks — if the lease is older than the allowed threshold, health check reports are considered stale.
+
+The Gardener library provides the heartbeat controller out of the box. Register it in your `main.go`:
+
+```go
+import (
+    "github.com/gardener/gardener/extensions/pkg/controller/heartbeat"
+    heartbeatcmd "github.com/gardener/gardener/extensions/pkg/controller/heartbeat/cmd"
+)
+
+func main() {
+    // ... setup manager ...
+
+    if err := heartbeat.Add(mgr, heartbeatcmd.Options{
+        ExtensionName:        "my-extension",
+        RenewIntervalSeconds: 30,
+        Namespace:            operatorNamespace,
+    }); err != nil {
+        panic(err)
+    }
+}
+```
+
+<Warning>
+Forgetting to implement the heartbeat controller will cause `gardenlet` to mark your extension's health checks as outdated, resulting in degraded shoot status even when the extension is functioning correctly.
+</Warning>
+
+## Health check library
+
+The health check library lets you register health checks for dependent objects (Deployments, DaemonSets, StatefulSets, ManagedResources) with minimal code. Register checks using `DefaultRegisterExtensionForHealthCheck`:
+
+```go
+import (
+    health "github.com/gardener/gardener/extensions/pkg/controller/healthcheck"
+    "github.com/gardener/gardener/extensions/pkg/controller/healthcheck/general"
+    extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+    gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
+)
+
+func AddHealthCheckControllers(mgr manager.Manager, opts controller.Options) error {
+    return health.DefaultRegisterExtensionForHealthCheck(
+        myProviderType,
+        extensionsv1alpha1.SchemeGroupVersion.WithKind(extensionsv1alpha1.WorkerResource),
+        func() runtime.Object { return &extensionsv1alpha1.Worker{} },
+        mgr,
+        opts,
+        nil, // custom predicates
+        map[extensionshealthcheckcontroller.HealthCheck]string{
+            general.CheckManagedResource(mcmShootResourceName):     string(gardencorev1beta1.ShootSystemComponentsHealthy),
+            general.CheckSeedDeployment(machineControllerManager):  string(gardencorev1beta1.ShootEveryNodeReady),
+            worker.SufficientNodesAvailable():                      string(gardencorev1beta1.ShootEveryNodeReady),
+        })
+}
+```
+
+Health checks run every 30 seconds by default and write condition results to the extension resource's `.status.conditions`:
+
+```yaml
+status:
+  conditions:
+    - lastTransitionTime: "20XX-10-28T08:17:21Z"
+      lastUpdateTime: "20XX-11-28T08:17:21Z"
+      message: (1/1) Health checks successful
+      reason: HealthCheckSuccessful
+      status: "True"
+      type: SystemComponentsHealthy
+    - lastTransitionTime: "20XX-10-28T08:17:21Z"
+      lastUpdateTime: "20XX-11-28T08:17:21Z"
+      message: (2/2) Health checks successful
+      reason: HealthCheckSuccessful
+      status: "True"
+      type: EveryNodeReady
+```
+
+Condition status values: `True` (healthy), `False` (unhealthy), `Unknown` (error checking), `Progressing` (expected transient state, e.g., scaling).
+
+### Custom health checks
+
+Implement the `HealthCheck` interface for checks beyond built-in types:
+
+```go
+type HealthCheck interface {
+    Check(context.Context, types.NamespacedName) (*SingleCheckResult, error)
+    SetLoggerSuffix(string, string)
+}
+```
+
+To access cluster clients in your health check, implement the client injection interfaces:
+
+```go
+type MyShootHealthCheck struct {
+    targetClient client.Client
+}
+
+func (h *MyShootHealthCheck) InjectTargetClient(c client.Client) {
+    h.targetClient = c
+}
+
+func (h *MyShootHealthCheck) Check(ctx context.Context, request types.NamespacedName) (*SingleCheckResult, error) {
+    // Use h.targetClient to check resources in the shoot cluster
+    return &SingleCheckResult{IsHealthy: true}, nil
+}
+```
+
+- `TargetClient`: shoot cluster client (for shoot-class extensions)
+- `SourceClient`: seed cluster client (for shoot-class extensions) or garden runtime cluster client (for garden-class extensions)
+
+## Admission webhook
+
+Run an admission component in the garden runtime cluster to validate extension-specific configuration in `Shoot` resources (and other resources like `CloudProfile`, `BackupBucket`, etc.) before they are persisted.
+
+Gardener adds extension labels to admission-relevant resources so your webhook can filter efficiently. For example, a provider extension for AWS receives resources labeled `provider.extensions.gardener.cloud/aws: "true"`.
+
+```go
+// Register a validating webhook for Shoot resources
+mgr.GetWebhookServer().Register("/validate-shoot",
+    &admission.Webhook{
+        Handler: &shootValidator{
+            client: mgr.GetClient(),
+        },
+    },
+)
+```
+
+As a best practice, only validate when `.spec` has changed — avoid triggering on metadata-only updates:
+
+```go
+func (v *shootValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
+    shoot := &gardencorev1beta1.Shoot{}
+    if err := v.decoder.Decode(req, shoot); err != nil {
+        return admission.Errored(http.StatusBadRequest, err)
+    }
+
+    // Only validate spec changes
+    if req.Operation == admissionv1.Update {
+        oldShoot := &gardencorev1beta1.Shoot{}
+        if err := v.decoder.DecodeRaw(req.OldObject, oldShoot); err != nil {
+            return admission.Errored(http.StatusBadRequest, err)
+        }
+        if reflect.DeepEqual(shoot.Spec, oldShoot.Spec) {
+            return admission.Allowed("spec unchanged")
+        }
+    }
+
+    // Validate provider-specific configuration
+    if err := v.validateInfrastructureConfig(shoot); err != nil {
+        return admission.Denied(err.Error())
+    }
+    return admission.Allowed("")
+}
+```
+
+## Control plane customization webhooks
+
+Provider extensions often need to inject provider-specific flags or mounts into standard control plane components deployed by Gardener. This is done via `MutatingWebhookConfiguration` objects registered in the seed cluster.
+
+Two webhook types are available:
+
+<Tabs>
+  <Tab title="Shoot (controlplane) webhooks">
+    Apply changes needed by the shoot cloud provider. These webhooks should only operate on shoot namespaces labeled with `shoot.gardener.cloud/provider=<your-provider>`.
+
+    Common uses:
+    - Add `--cloud-provider=external` to `kube-controller-manager`
+    - Mount cloud-config `ConfigMap` into `kube-controller-manager`
+    - Add `--cloud-config` and `--provider-id` flags to `kubelet` (via `OperatingSystemConfig` webhook)
+  </Tab>
+  <Tab title="Seed (seedprovider) webhooks">
+    Apply changes needed by the seed cloud provider. These webhooks operate on shoot namespaces labeled with `seed.gardener.cloud/provider=<your-provider>`.
+
+    Common uses:
+    - Adapt storage class and capacity on `Etcd` objects
+  </Tab>
+</Tabs>
+
+Resources mutated by controlplane webhooks are labeled `provider.extensions.gardener.cloud/mutated-by-controlplane-webhook: true` by `gardenlet`. Add an object selector on this label to avoid intercepting unrelated requests.
+
+**Contract for kube-controller-manager:**
+
+Gardener deploys `kube-controller-manager` **without** provider-specific flags. Your webhook may add flags such as:
+- `--cloud-provider`
+- `--cloud-config`
+- `--configure-cloud-routes`
+- `--external-cloud-volume-plugin`
+
+Do not modify provider-independent flags like `--kubeconfig`, `--leader-elect`, `--cluster-cidr`, or `--cluster-name`.
+
+## Deploying resources to the shoot cluster
+
+Use `ManagedResource` objects (managed by `gardener-resource-manager`) to deploy resources into the shoot cluster from your extension running in the seed. This approach ensures that end-users cannot accidentally delete or modify extension-managed resources.
+
+```go
+import (
+    resourcesv1alpha1 "github.com/gardener/gardener/pkg/apis/resources/v1alpha1"
+)
+
+// Create a ManagedResource in the shoot namespace (seed)
+mr := &resourcesv1alpha1.ManagedResource{
+    ObjectMeta: metav1.ObjectMeta{
+        Name:      "my-extension-shoot-resources",
+        Namespace: shootNamespace,
+    },
+    Spec: resourcesv1alpha1.ManagedResourceSpec{
+        Resources: []resourcesv1alpha1.ObjectReference{
+            {
+                GroupVersionKind: schema.GroupVersionKind{
+                    Group:   "rbac.authorization.k8s.io",
+                    Version: "v1",
+                    Kind:    "ClusterRole",
+                },
+                Name: "my-extension-role",
+            },
+        },
+    },
+}
+```
+
+<Note>
+Gardener acts on `ManagedResources` with the `origin=gardener` label. To prevent conflicts, omit the `origin` label or use your own unique value when creating `ManagedResource` objects from your extension.
+</Note>
+
+## Naming conventions
+
+To avoid conflicts between extensions when creating global resources (e.g., `ClusterRole`s), follow this naming scheme:
+
+```
+extensions.gardener.cloud:<extension-type>-<extension-name>:<resource-name>
+```
+
+Examples:
+- `extensions.gardener.cloud:provider-aws:some-controller-manager`
+- `extensions.gardener.cloud:extension-certificate-service:cert-broker`
+
+## Status reporting conventions
+
+<Steps>
+  <Step title="Set observedGeneration">
+    Always set `.status.observedGeneration` to `.metadata.generation` at the end of a successful reconciliation. Gardener uses this to detect whether the status reflects the current spec.
+  </Step>
+  <Step title="Update lastOperation">
+    Set `.status.lastOperation.state` to `Succeeded`, `Failed`, or `Processing`. Gardener monitors this to know when to proceed in the reconciliation flow.
+  </Step>
+  <Step title="Report lastError on failure">
+    Populate `.status.lastError` with a structured error when reconciliation fails. Use the appropriate error codes (`ERR_CONFIGURATION_PROBLEM`, `ERR_INFRA_QUOTA_EXCEEDED`, etc.) to help operators diagnose issues.
+  </Step>
+  <Step title="Write providerStatus">
+    Store provider-specific output (resource IDs, network details, etc.) in `.status.providerStatus`. Gardener forwards this to subsequent extension resources that need it.
+  </Step>
+</Steps>
+
+## Priority classes
+
+Do not create custom `PriorityClass` objects. Use the well-known `PriorityClass` objects managed by `gardenlet` instead. These are documented in the [Gardener priority classes reference](https://github.com/gardener/gardener/blob/master/docs/development/priority-classes.md).
+
+## High availability
+
+Extensions deploying `Deployment`, `StatefulSet`, or similar workloads into shoot control planes must handle high availability correctly. For seeds and shoots with failure tolerance configured, adjust `replicas`, `topologySpreadConstraints`, and `affinity` settings accordingly.
+
+Gardener provides a mutating webhook that handles this automatically. Register your workloads with the HA webhook instead of implementing HA logic manually. See [High Availability of Deployed Components](https://github.com/gardener/gardener/blob/master/docs/development/high-availability-of-components.md) for details.
+
+## Pod security
+
+Set the pod security enforce level for your extension's namespace by adding the `security.gardener.cloud/pod-security-enforce` annotation to your `ControllerRegistration`. Use the most restrictive standard your pods comply with:
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerRegistration
+metadata:
+  name: my-extension
+  annotations:
+    security.gardener.cloud/pod-security-enforce: restricted
+```
+
+If not set, the annotation defaults to `baseline`.
+
+## kubeconfigs and CA rotation
+
+Extensions that need to access the shoot API server must use short-lived `ServiceAccount` tokens managed by `gardener-resource-manager`'s `TokenRequestor`, not client certificates. This is required to support shoot cluster CA rotation.
+
+Use the `generic-token-kubeconfig` secret (whose current name is stored in the `generic-token-kubeconfig.secret.gardener.cloud/name` annotation on the `Cluster` resource) for authentication:
+
+```go
+import extensionscontroller "github.com/gardener/gardener/extensions/pkg/controller"
+
+secretName := extensionscontroller.GenericTokenKubeconfigSecretNameFromCluster(cluster)
+```
+
+See [CA Rotation in Extensions](https://github.com/gardener/gardener/blob/master/docs/extensions/ca-rotation.md) for the full requirements around certificate management.

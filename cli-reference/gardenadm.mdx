@@ -1,0 +1,407 @@
+---
+title: "gardenadm CLI Reference: Self-Hosted Shoot Clusters"
+description: "Complete reference for the gardenadm CLI tool: bootstrap, init, join, connect, discover, token, and version commands for self-hosted shoot clusters."
+---
+
+`gardenadm` is a command-line tool for bootstrapping and managing self-hosted shoot clusters in the Gardener project. A self-hosted shoot cluster (also called an autonomous shoot cluster) runs its own Gardener control plane on top of itself, without relying on a central garden cluster for day-to-day operations.
+
+```bash
+gardenadm [command] [flags]
+```
+
+## Global flags
+
+These flags apply to all `gardenadm` commands:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--log-format` | `text` | Log output format. One of `json` or `text`. |
+| `--log-level` | `info` | Log severity level. One of `debug`, `info`, or `error`. |
+| `-h`, `--help` | — | Show help for any command. |
+
+## Commands
+
+<AccordionGroup>
+
+  <Accordion title="gardenadm bootstrap">
+
+Bootstrap the infrastructure for a self-hosted shoot cluster — provisioning the networks, machines, and other cloud resources needed to host the control plane.
+
+```bash
+gardenadm bootstrap [flags]
+```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--bastion-ingress-cidr` | Restrict bastion host ingress to the given CIDRs. Defaults to your system's detected public IPs (IPv4 and/or IPv6) via ipify.org. |
+| `-d`, `--config-dir` | Path to a directory containing Gardener configuration files (CloudProfile, Shoot, etc.) in YAML or JSON format with `.yaml`, `.yml`, or `.json` extensions. |
+| `-k`, `--kubeconfig` | Path to a kubeconfig file pointing to the bootstrap cluster. |
+| `--kubeconfig-output` | Path where the shoot cluster's kubeconfig should be written. Set to `-` to write to stdout. |
+| `-h`, `--help` | Help for `bootstrap`. |
+
+### Examples
+
+```bash
+# Bootstrap the infrastructure using manifests in a local directory
+gardenadm bootstrap --config-dir /path/to/manifests
+
+# Bootstrap and write the resulting kubeconfig to a file
+gardenadm bootstrap --config-dir /path/to/manifests \
+  --kubeconfig-output /path/to/shoot-kubeconfig.yaml
+```
+
+  </Accordion>
+
+  <Accordion title="gardenadm init">
+
+Bootstrap the first control plane node of a self-hosted shoot cluster. This command initializes the node, configures the Kubernetes control plane components (etcd, kube-apiserver, etc.), and sets up Gardener's node-agent.
+
+Run this command on the first control plane machine after `gardenadm bootstrap` has provisioned the infrastructure.
+
+```bash
+gardenadm init [flags]
+```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `-d`, `--config-dir` | Path to a directory containing Gardener configuration files (CloudProfile, Shoot, etc.). |
+| `--use-bootstrap-etcd` | Continue using the bootstrap etcd instead of transitioning to etcd-druid. Useful for testing to save time. |
+| `-z`, `--zone` | Availability zone for the new node. Required if the control plane worker pool in the Shoot has multiple zones configured. Optional if exactly one zone is configured. Must not be set if no zones are configured. |
+| `-h`, `--help` | Help for `init`. |
+
+### Examples
+
+```bash
+# Bootstrap the first control plane node
+gardenadm init --config-dir /path/to/manifests
+
+# Bootstrap in a specific availability zone (required for multi-zone control planes)
+gardenadm init --config-dir /path/to/manifests --zone zone-a
+```
+
+  </Accordion>
+
+  <Accordion title="gardenadm join">
+
+Bootstrap additional control plane or worker nodes and join them to an existing self-hosted shoot cluster. Use `gardenadm token create --print-join-command` on an existing control plane node to generate the exact command to run on the joining node.
+
+```bash
+gardenadm join [flags] <control-plane-address>
+```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--bootstrap-token` | Bootstrap token for joining the cluster. Create with `gardenadm token create` on a control plane node. |
+| `--ca-certificate` | Base64-encoded certificate authority bundle of the control plane. |
+| `--control-plane` | Create a new control plane instance on this node (for adding control plane nodes to a multi-node HA setup). |
+| `-w`, `--worker-pool-name` | Name of the worker pool to assign this node to. Defaults to the first worker pool in the Shoot manifest. |
+| `-z`, `--zone` | Availability zone for the new node. Required if the worker pool has multiple zones configured. |
+| `-h`, `--help` | Help for `join`. |
+
+### Examples
+
+```bash
+# Join a new control plane node
+gardenadm join \
+  --bootstrap-token abc123.def4567890ghijkl \
+  --ca-certificate <base64-ca-cert> \
+  --control-plane \
+  10.0.0.10:6443
+
+# Join a control plane node in a specific zone
+gardenadm join \
+  --bootstrap-token abc123.def4567890ghijkl \
+  --ca-certificate <base64-ca-cert> \
+  --control-plane --zone zone-a \
+  10.0.0.10:6443
+
+# Join a worker node (assigned to the first worker pool)
+gardenadm join \
+  --bootstrap-token abc123.def4567890ghijkl \
+  --ca-certificate <base64-ca-cert> \
+  10.0.0.10:6443
+
+# Join a worker node in a specific pool
+gardenadm join \
+  --bootstrap-token abc123.def4567890ghijkl \
+  --ca-certificate <base64-ca-cert> \
+  --worker-pool-name gpu-workers \
+  10.0.0.10:6443
+```
+
+  </Accordion>
+
+  <Accordion title="gardenadm connect">
+
+Deploy a gardenlet into the self-hosted shoot cluster to connect it to an external Gardener control plane for ongoing management. After connecting, the shoot cluster becomes a managed seed or is tracked by a garden cluster.
+
+```bash
+gardenadm connect [flags]
+```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--bootstrap-token` | Bootstrap token for connecting the shoot cluster to the garden cluster. Create with `gardenadm token create --print-connect-command` in the garden cluster. |
+| `--ca-certificate` | Base64-encoded certificate authority bundle of the Gardener control plane. |
+| `-d`, `--config-dir` | Path to a directory containing Gardener configuration files. |
+| `--force` | Forces gardenlet deployment even if one already exists. |
+| `-h`, `--help` | Help for `connect`. |
+
+### Examples
+
+```bash
+# Deploy a gardenlet and connect to a garden cluster
+gardenadm connect \
+  --bootstrap-token abc123.def4567890ghijkl \
+  --ca-certificate <base64-ca-cert>
+
+# Force redeploy if gardenlet already exists
+gardenadm connect --force
+```
+
+  </Accordion>
+
+  <Accordion title="gardenadm discover">
+
+Download Gardener configuration resources from an existing garden cluster. This command fetches resources such as `CloudProfile`, `ControllerRegistration`, and `ControllerDeployment` from a garden cluster and writes them to a local directory, providing a starting point for a self-hosted configuration.
+
+```bash
+gardenadm discover [flags] <path-to-shoot-manifest>
+```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `-d`, `--config-dir` | Path to the directory where downloaded configuration files are written. |
+| `-k`, `--kubeconfig` | Path to a kubeconfig file pointing to the source garden cluster. |
+| `--managed-infrastructure` | Indicates whether Gardener manages the shoot's infrastructure (networks, domains, machines). Set to `true` when using `gardenadm bootstrap`. Set to `false` when managing infrastructure externally. Defaults to `true`. |
+| `-h`, `--help` | Help for `discover`. |
+
+### Examples
+
+```bash
+# Download configuration from an existing garden cluster
+gardenadm discover \
+  --kubeconfig /path/to/garden-kubeconfig.yaml \
+  --config-dir /path/to/output \
+  /path/to/shoot-manifest.yaml
+```
+
+  </Accordion>
+
+  <Accordion title="gardenadm token">
+
+Manage bootstrap and discovery tokens used by `gardenadm join` and `gardenadm connect`. Tokens follow the Kubernetes bootstrap token format: `[a-z0-9]{6}.[a-z0-9]{16}`.
+
+```bash
+gardenadm token [subcommand] [flags]
+```
+
+### Subcommands
+
+<AccordionGroup>
+
+  <Accordion title="gardenadm token create">
+
+Create a bootstrap token on the cluster for joining a node or connecting a shoot cluster to Gardener.
+
+```bash
+gardenadm token create [token] [flags]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-d`, `--description` | — | Description for the bootstrap token. |
+| `-j`, `--print-join-command` | false | Print the full `gardenadm join` command instead of just the token. |
+| `-c`, `--print-connect-command` | false | Print the full `gardenadm connect` command for connecting a shoot to Gardener. |
+| `--shoot-name` | — | Name of the Shoot to connect (used with `--print-connect-command`). |
+| `--shoot-namespace` | — | Namespace of the Shoot to connect (used with `--print-connect-command`). |
+| `--validity` | `1h` | Validity duration for the token. Minimum `10m`, maximum `24h`. |
+
+**Examples:**
+
+```bash
+# Create a token with a specific ID and secret
+gardenadm token create foo123.bar4567890baz123
+
+# Create a token and print the join command for a new node
+gardenadm token create foo123.bar4567890baz123 --print-join-command
+
+# Create a token and print the connect command for connecting a shoot to Gardener
+gardenadm token create foo123.bar4567890baz123 \
+  --print-connect-command \
+  --shoot-namespace=garden \
+  --shoot-name=root
+
+# Generate and create a random token
+gardenadm token create
+```
+
+  </Accordion>
+
+  <Accordion title="gardenadm token delete">
+
+Delete one or more bootstrap tokens from the cluster.
+
+The token value can be specified as:
+- The 6-character token ID: `foo123`
+- The full token value: `foo123.bar4567890baz123`
+- The Secret name: `bootstrap-token-foo123`
+
+```bash
+gardenadm token delete [token-values...] [flags]
+```
+
+**Examples:**
+
+```bash
+# Delete a single token by ID
+gardenadm token delete foo123
+
+# Delete multiple tokens
+gardenadm token delete foo123 bootstrap-token-bar456 789baz.abcdef1234567890
+
+# Attempt to delete a non-existent token (no error)
+gardenadm token delete nonexisting123
+```
+
+  </Accordion>
+
+  <Accordion title="gardenadm token generate">
+
+Generate a random bootstrap token locally without creating it on the server. The token follows the format `[a-z0-9]{6}.[a-z0-9]{16}`. Use `gardenadm token create` to actually register the generated token.
+
+```bash
+gardenadm token generate [flags]
+```
+
+**Examples:**
+
+```bash
+# Generate a random token (printed to stdout, not registered on the cluster)
+gardenadm token generate
+
+# Generate a token and pipe it to create
+gardenadm token create $(gardenadm token generate)
+```
+
+  </Accordion>
+
+  <Accordion title="gardenadm token list">
+
+Display all bootstrap tokens currently available on the cluster.
+
+```bash
+gardenadm token list [flags]
+```
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `--with-token-secret` | Display the token secret (sensitive — handle with care). |
+
+**Examples:**
+
+```bash
+# List all bootstrap tokens
+gardenadm token list
+
+# List tokens including secrets
+gardenadm token list --with-token-secret
+```
+
+  </Accordion>
+
+</AccordionGroup>
+
+  </Accordion>
+
+  <Accordion title="gardenadm version">
+
+Print the client version information for `gardenadm`.
+
+```bash
+gardenadm version [flags]
+```
+
+### Examples
+
+```bash
+gardenadm version
+```
+
+  </Accordion>
+
+</AccordionGroup>
+
+## Typical workflow
+
+The following sequence shows how to set up a self-hosted shoot cluster from scratch:
+
+<Steps>
+
+<Step title="Discover configuration">
+  Download CloudProfiles and ControllerRegistrations from an existing garden cluster:
+
+  ```bash
+  gardenadm discover \
+    --kubeconfig /path/to/garden-kubeconfig.yaml \
+    --config-dir /path/to/config \
+    /path/to/shoot.yaml
+  ```
+</Step>
+
+<Step title="Bootstrap infrastructure">
+  Provision the cloud infrastructure (VPC, subnets, VMs):
+
+  ```bash
+  gardenadm bootstrap --config-dir /path/to/config
+  ```
+</Step>
+
+<Step title="Initialize the first control plane node">
+  SSH to the first control plane machine and run:
+
+  ```bash
+  gardenadm init --config-dir /path/to/config --zone zone-a
+  ```
+</Step>
+
+<Step title="Join additional nodes">
+  Create a join token on the initialized node:
+
+  ```bash
+  gardenadm token create --print-join-command
+  ```
+
+  Then run the printed command on each additional node.
+</Step>
+
+<Step title="Connect to a garden cluster">
+  Optionally connect the self-hosted shoot to an external Gardener installation:
+
+  ```bash
+  # On the garden cluster, create a connect token
+  gardenadm token create --print-connect-command \
+    --shoot-namespace=garden --shoot-name=my-shoot
+
+  # On the self-hosted shoot, run the printed connect command
+  gardenadm connect \
+    --bootstrap-token <token> \
+    --ca-certificate <ca-cert>
+  ```
+</Step>
+
+</Steps>

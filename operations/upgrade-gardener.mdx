@@ -1,0 +1,256 @@
+---
+title: "Upgrading Gardener: Version Skew and Procedure"
+description: "Upgrade Gardener in the correct component order: version skew policy, operator update, gardenlet self-upgrade, and post-upgrade shoot reconciliation."
+---
+
+Upgrading Gardener is a multi-step process that updates its core components, including the operator, control plane, gardenlets, and the clusters it manages (seeds and shoots). The process works with Gardener's built-in reconciliation and rollout mechanisms, which automatically apply changes across your landscape once components are upgraded in the correct order.
+
+<Warning>
+Downgrading Gardener versions is **not tested** during development and should be considered unsupported. Always upgrade forward, one minor version at a time.
+</Warning>
+
+## Version Skew Policy
+
+Before upgrading, understand the version skew constraints between Gardener components. Violating these constraints can result in components that refuse to start or that produce incorrect behavior.
+
+### Supported Version Skew
+
+Gardener follows the same version skew policy as the Kubernetes project. However, given Gardener's much more frequent release cadence (every ~14 days vs. ~120 days for Kubernetes), skipping minor versions is technically possible but **not tested**. To be safe, always increment the minor version one step at a time.
+
+<AccordionGroup>
+  <Accordion title="gardener-apiserver">
+    In multi-instance setups, the newest and oldest `gardener-apiserver` instances must be within **one minor version** of each other.
+
+    Example: if newest is at **1.37**, other instances are supported at **1.37** and **1.36**.
+  </Accordion>
+
+  <Accordion title="gardener-controller-manager, gardener-scheduler, gardener-admission-controller">
+    These components must **not be newer** than the `gardener-apiserver` they communicate with. They may be up to **one minor version older** (to allow live upgrades).
+
+    Example: `gardener-apiserver` at **1.37** → these components supported at **1.37** and **1.36**.
+  </Accordion>
+
+  <Accordion title="gardenlet">
+    - `gardenlet` must **not be newer** than `gardener-apiserver`
+    - `gardenlet` may be up to **two minor versions older** than `gardener-apiserver`
+
+    Example: `gardener-apiserver` at **1.37** → gardenlet supported at **1.37**, **1.36**, and **1.35**.
+
+    Running gardenlets persistently two minor versions behind means they must be upgraded before the control plane can be upgraded again.
+  </Accordion>
+
+  <Accordion title="gardener-operator">
+    Follows the same policy as `gardener-apiserver`. The operator manages the control plane components, so it must stay within one minor version.
+
+    `gardener-operator` implements startup checks that cause it to **crash** if:
+    - It is being downgraded
+    - Its version skips at least one minor version during upgrade
+
+    This is a safety mechanism to prevent misconfigured landscapes.
+  </Accordion>
+
+  <Accordion title="Extensions">
+    Extensions are released independently. A key constraint is: **no extension must depend on a version of the extensions library higher than the version of `gardenlet`**.
+
+    Example: if some gardenlets are at **1.36** and others at **1.37**, only extensions depending on **1.36** or lower of the extensions library are supported across all seeds.
+
+    Always check the extension's release notes for compatibility with your target Gardener version.
+  </Accordion>
+</AccordionGroup>
+
+### Component Upgrade Order (1.37 → 1.38 Example)
+
+The version skew constraints determine the correct upgrade order:
+
+<Steps>
+  <Step title="Upgrade gardener-apiserver">
+    **Prerequisites**:
+    - Single-instance: existing `gardener-apiserver` is at **1.37**
+    - Multi-instance: all instances are at **1.37** or **1.38**
+    - `gardener-controller-manager`, `gardener-scheduler`, `gardener-admission-controller` are at **1.37**
+    - `gardenlet` instances on all seeds are at **1.37** or **1.36**
+
+    **Action**: Upgrade `gardener-apiserver` to **1.38**
+  </Step>
+
+  <Step title="Upgrade gardener-controller-manager, gardener-scheduler, gardener-admission-controller">
+    **Prerequisites**:
+    - `gardener-apiserver` is at **1.38** (all instances in multi-instance setups)
+
+    **Action**: Upgrade these three components to **1.38**
+  </Step>
+
+  <Step title="Upgrade gardenlets (optional but recommended)">
+    **Prerequisites**:
+    - `gardener-apiserver` is at **1.38**
+
+    **Action**: Upgrade gardenlet instances to **1.38**. They can remain at **1.37** or **1.36**, but persistently lagging by two minor versions means they must be upgraded before the next control plane upgrade.
+  </Step>
+</Steps>
+
+## Step-by-Step Upgrade Procedure
+
+### Step 1: Prepare Before Touching Anything
+
+Read the [release notes](https://github.com/gardener/gardener/releases) for your target version carefully. Notes are tagged by audience:
+
+- `[USER]` — end-users or users of `Shoot` resources
+- `[OPERATOR]` — operators deploying Gardener, managing configuration and seed clusters
+- `[DEVELOPER]` — developers changing or reviewing code
+- `[DEPENDENCY]` — developers depending on code in this repository
+
+Focus on `[OPERATOR]` and `[USER]` notes.
+
+**Handling breaking changes**: If the release notes call for manual steps, apply those changes to your configuration files (manifests) **before** updating version numbers. This prevents components from starting with an incompatible configuration.
+
+Deprecation timelines to be aware of:
+- Operator-level APIs (`Garden`, `Seed`) are deprecated for at least **three minor releases** before removal
+- Extension APIs have an even longer deprecation period — typically **nine minor releases**
+- `[USER]` changes to the `Shoot` API are typically tied to Kubernetes minor version upgrades
+
+### Step 2: Upgrade gardener-operator and the Control Plane
+
+Deploy the new `gardener-operator` using its [Helm chart](https://github.com/gardener/gardener/tree/master/charts/gardener/operator). Once running, the operator automatically updates the `Garden` resource, rolling out new versions of `gardener-apiserver`, `gardener-controller-manager`, and other control plane components.
+
+#### Private Registry / Image Vector Overwrites
+
+If your organization requires a private container registry, use an image vector overwrite to redirect image pulls. Each Gardener release includes a `component-descriptor.yaml` as a release asset, listing all container images for that version. Use it to:
+
+1. Pull images from the official registry
+2. Push them to your private registry
+3. Generate an image vector overwrite configuration
+
+Follow the [image vector documentation](https://github.com/gardener/gardener/blob/master/docs/deployment/image_vector.md) for detailed instructions.
+
+#### Upgrading Extensions
+
+With `gardener-operator`, upgrade extensions by updating the OCI references in their `operator.gardener.cloud/v1alpha1.Extension` resources in the runtime cluster:
+
+```yaml
+spec:
+  deployment:
+    extension:
+      helm:
+        ociRepository:
+          repository: europe-docker.pkg.dev/gardener-project/releases/charts/...
+          tag: v1.45.0  # updated version
+```
+
+Always check the extension's own release notes for compatibility with the target Gardener version.
+
+#### Verify Control Plane Readiness
+
+Before proceeding to gardenlet upgrades, verify the `Garden` resource is fully updated:
+
+```bash
+kubectl get garden <name> -o jsonpath='{.status}'
+```
+
+Check all of the following:
+- `gardener.cloud/operation` annotation is **removed** (operation complete)
+- `.status.gardener.version` shows your **target version**
+- `.status.observedGeneration` matches `.metadata.generation`
+- `.status.lastOperation.state` is `Succeeded`
+- All `.status.conditions[]` report `True`
+
+Also check that all `operator.gardener.cloud/v1alpha1.Extension` resources report healthy conditions.
+
+<Note>
+At this stage, it is normal for gardenlets to still be running the old version. This mirrors the Kubernetes pattern of upgrading the control plane before worker node components.
+</Note>
+
+### Step 3: Upgrade Gardenlets
+
+#### Unmanaged Seeds
+
+Start with gardenlets managing "unmanaged" seeds (seed clusters not created as `Shoot`s). These are configured using `Gardenlet` resources in the `garden` namespace of the virtual Garden cluster.
+
+**Auto-update enabled** (recommended for automation):
+
+If the `operator.gardener.cloud/auto-update-gardenlet-helm-chart-ref=true` label is present on your `Gardenlet` resources, `gardener-operator` automatically triggers the upgrade. Gardenlets then perform a self-upgrade.
+
+**GitOps / manual management**:
+
+If you manage `Gardenlet` resources with a GitOps tool like Flux, do **not** use the auto-update label. Instead, update the Helm chart reference directly:
+
+```yaml
+spec:
+  deployment:
+    helm:
+      ociRepository:
+        ref: <url-to-gardenlet-chart-repository>:v1.38.0  # new version
+```
+
+#### Managed Seeds
+
+Once an unmanaged seed's gardenlet is upgraded, it automatically begins upgrading any managed seeds it controls. No manual action is needed. Note that a `ManagedSeed` upgrade waits until any ongoing reconciliation of its underlying `Shoot` is complete.
+
+Upgrades are staggered using a "jitter" period (default: **5 minutes**) to avoid overloading the system. Configure this in the gardenlet's component configuration:
+
+```yaml
+# example/20-componentconfig-gardenlet.yaml
+controllers:
+  managedSeed:
+    syncJitterPeriod: 5m  # set to 0 to start all upgrades immediately
+```
+
+#### Verify Seed Readiness
+
+For each `Seed` resource, verify:
+
+```bash
+kubectl get seed <name> -o jsonpath='{.status}'
+```
+
+- `gardener.cloud/operation` annotation is **removed**
+- `.status.gardener.version` shows your **target version**
+- `.status.observedGeneration` matches `.metadata.generation`
+- `.status.lastOperation.state` is `Succeeded`
+- All `.status.conditions[]` report `True`
+
+### Step 4: Shoot Reconciliations
+
+After gardenlet upgrades, all managed `Shoot` clusters are reconciled. In large landscapes, reconciling all shoots immediately may be disruptive.
+
+**Maintenance-window reconciliation** (recommended for large landscapes):
+
+```yaml
+# gardenlet component configuration
+controllers:
+  shoot:
+    reconcileInMaintenanceOnly: true
+```
+
+With this setting, shoots are reconciled during their next scheduled maintenance window (typically within 24 hours). Learn more about [shoot maintenance and operations](/usage/shoot-operations).
+
+<Warning>
+Make sure all `Shoot`s have been reconciled with the **current** Gardener version before upgrading to the next version. Check `.status.gardener.version` on each `Shoot` to verify. If using maintenance-window-only reconciliation, wait at least **24 hours** before upgrading again.
+</Warning>
+
+#### Operating System Config Updates
+
+Gardener upgrades also roll out new versions of `gardener-node-agent` to each worker node of all `Shoot`s. This rollout happens during `Shoot` reconciliation and may include other OS configuration updates.
+
+Updates are staggered by default to prevent simultaneous kubelet restarts across all nodes. The default rollout completes within **5 minutes**. Customize per shoot with:
+
+```yaml
+metadata:
+  annotations:
+    shoot.gardener.cloud/cloud-config-execution-max-delay-seconds: "300"
+```
+
+- `0` — update all nodes in parallel immediately
+- `1800` — maximum value, spreads the update over 30 minutes
+
+## Summary: Upgrade Order
+
+```
+1. Read release notes → apply breaking changes to manifests
+2. Upgrade gardener-operator (triggers control plane upgrade)
+3. Verify Garden resource is healthy
+4. Upgrade gardenlets on unmanaged seeds
+5. Wait for managed seeds to auto-upgrade
+6. Verify all Seed resources are healthy
+7. Wait for Shoot reconciliations (or trigger maintenance)
+8. Verify all Shoots show the new version
+```

@@ -1,0 +1,206 @@
+---
+title: "Gardener Configuration and Usage Guide"
+description: "Configure Gardener components including admission controller, controller manager, scheduler, and gardenlet, plus domain and alerting secrets."
+---
+
+Gardener automates the full lifecycle of Kubernetes clusters as a service, with extension points that allow external controllers to plug into the lifecycle. As a result, there are configuration options at multiple levels: the Gardener control plane components, the custom resources they manage, and the system-level secrets that define landscape-wide behavior. This guide covers both the operator/administrator view (deploying and configuring Gardener itself) and the end-user view (consuming a deployed Gardener landscape).
+
+## Gardener Components
+
+A Gardener installation consists of five main components, each with its own configuration:
+
+<CardGroup cols={2}>
+  <Card title="gardener-apiserver" icon="server">
+    A Kubernetes-native API extension that serves custom resources (`Seed`s, `Shoot`s, etc.) and contains multiple admission plugins. Uses standard API server library command-line flags.
+  </Card>
+  <Card title="gardener-admission-controller" icon="shield-check">
+    An HTTPS server with several webhook handlers used in a `ValidatingWebhookConfiguration`. Configured via a component configuration file.
+  </Card>
+  <Card title="gardener-controller-manager" icon="gear">
+    Multiple controllers implementing reconciliation and deletion flows for custom resources — including `Shoot` maintenance, `Project` reconciliation, and more.
+  </Card>
+  <Card title="gardener-scheduler" icon="calendar">
+    Assigns newly created `Shoot` clusters to appropriate `Seed` clusters based on scheduling filters and constraints.
+  </Card>
+  <Card title="gardenlet" icon="leaf">
+    Runs in each seed cluster. Contains multiple controllers that implement reconciliation and deletion of `Shoot`s and other resources. Communicates with the Gardener API server in the Garden cluster.
+  </Card>
+</CardGroup>
+
+## Component Configuration Files
+
+Each component (except `gardener-apiserver`) accepts a single command-line flag pointing to a Kubernetes-style versioned configuration file.
+
+<Tabs>
+  <Tab title="Admission Controller">
+    The admission controller accepts one flag: the path to a valid configuration file.
+
+    ```bash
+    gardener-admission-controller --config=/etc/gardener/admission-controller-config.yaml
+    ```
+
+    See the [example configuration](https://github.com/gardener/gardener/blob/master/example/20-componentconfig-gardener-admission-controller.yaml) for all available options including webhook configurations and TLS settings.
+  </Tab>
+  <Tab title="Controller Manager">
+    The controller manager accepts one flag: the path to a valid configuration file.
+
+    ```bash
+    gardener-controller-manager --config=/etc/gardener/controller-manager-config.yaml
+    ```
+
+    Key configuration areas include: reconciler concurrency settings, feature gates, and leader election. See the [example configuration](https://github.com/gardener/gardener/blob/master/example/20-componentconfig-gardener-controller-manager.yaml).
+  </Tab>
+  <Tab title="Scheduler">
+    The scheduler accepts one flag: the path to a valid configuration file.
+
+    ```bash
+    gardener-scheduler --config=/etc/gardener/scheduler-config.yaml
+    ```
+
+    The scheduler uses a plugin-based architecture for seed selection. See the [example configuration](https://github.com/gardener/gardener/blob/master/example/20-componentconfig-gardener-scheduler.yaml) and [Gardener Scheduler concepts](/concepts/scheduler).
+  </Tab>
+  <Tab title="gardenlet">
+    The gardenlet accepts one flag: the path to a valid configuration file.
+
+    ```bash
+    gardenlet --config=/etc/gardenlet/config.yaml
+    ```
+
+    The gardenlet configuration includes: garden cluster connection settings, seed configuration, controller settings, feature gates, and logging configuration. See the [example configuration](https://github.com/gardener/gardener/blob/master/example/20-componentconfig-gardenlet.yaml) and [gardenlet concepts](/concepts/gardenlet).
+  </Tab>
+</Tabs>
+
+## System Configuration
+
+After deploying the Gardener components, you need to set up the system by creating certain `Secret`s in the `garden` namespace of the Garden cluster. The `gardenlet` scans this namespace at startup for secrets that influence its reconciliation loops.
+
+### Internal Domain Secret
+
+The internal domain secret contains DNS provider credentials used to create and delete "internal" DNS records for shoot clusters. These records establish a stable endpoint for shoot clusters used internally by all control plane components.
+
+```yaml
+# Example: internal domain secret structure
+# See example/10-secret-internal-domain.yaml for the full format
+apiVersion: v1
+kind: Secret
+metadata:
+  name: internal-domain-<provider>-<domain-hash>
+  namespace: garden
+  annotations:
+    dns.gardener.cloud/provider: aws-route53
+    dns.gardener.cloud/domain: internal.my-landscape.example.com
+```
+
+<Warning>
+It is **forbidden** to change the internal domain secret if there are existing shoot clusters. Plan your internal domain carefully during initial landscape setup — changing it later requires migrating all existing shoot clusters.
+</Warning>
+
+### Default Domain Secrets
+
+Default domain secrets (optional) contain DNS provider credentials for creating shoot cluster DNS records under a Gardener-managed default domain (e.g., `shoots.example.com`). This allows end-users without their own domains to still get working DNS for their shoot clusters.
+
+Multiple default domain secrets can be configured. Use the `dns.gardener.cloud/domain-default-priority` annotation to control which domain is preferred for new shoots:
+
+```yaml
+metadata:
+  annotations:
+    dns.gardener.cloud/provider: aws-route53
+    dns.gardener.cloud/domain: shoots.my-landscape.example.com
+    dns.gardener.cloud/domain-default-priority: "100"
+```
+
+If no priority annotation is set, the default priority is `0`. The domain with the highest numeric priority is selected during shoot creation.
+
+### Alerting Secrets
+
+Alerting secrets (optional) configure the monitoring stack to send alerts. Two modes are supported:
+
+<Tabs>
+  <Tab title="Email Alerting (via AlertManager)">
+    When email alerting is configured:
+
+    - An `AlertManager` is deployed into each seed cluster to handle alerting for all shoots on that seed
+    - Gardener injects the SMTP credentials into the `AlertManager` configuration
+    - The `AlertManager` sends emails to the configured address when alerts fire
+
+    See [example/10-secret-alerting.yaml](https://github.com/gardener/gardener/blob/master/example/10-secret-alerting.yaml) for the configuration format.
+  </Tab>
+  <Tab title="External AlertManager">
+    When an external AlertManager is configured:
+
+    - Each shoot gets a dedicated Prometheus instance for monitoring
+    - Alerts are forwarded to the URL configured in the alerting secret
+    - The external AlertManager is not managed by Gardener
+
+    Supported authentication types:
+    - No authentication
+    - Basic authentication
+    - Mutual TLS (mTLS)
+  </Tab>
+</Tabs>
+
+### Global Monitoring Secrets
+
+Global monitoring secrets (optional) contain basic authentication credentials for the Prometheus instance that aggregates metrics across all clusters. These secrets are synced to each seed cluster to grant access to aggregate monitoring components.
+
+### Shoot Service Account Issuer Secret
+
+The shoot service account issuer secret (optional) configures gardenlets to implement [GEP-0024](https://github.com/gardener/enhancements/tree/main/geps/0024-shoot-oidc-issuer) — the shoot managed OIDC issuer feature.
+
+```yaml
+# See example/10-secret-shoot-service-account-issuer.yaml
+```
+
+<Warning>
+The hostname value in this secret **must not be changed** once configured, as it is used as the OIDC issuer URL for all shoot clusters using the managed issuer feature. Changing it would invalidate existing OIDC tokens.
+
+If you use `gardener-operator`, this field is managed automatically. It is calculated as `discovery.{garden.spec.runtimeCluster.ingress.domains[0]}`. Follow the same convention if migrating to `gardener-operator` later.
+</Warning>
+
+## Seed API Configuration
+
+The preferred way to configure domain settings is through the `Seed` API directly. This is more explicit and discoverable than relying on garden cluster secrets:
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Seed
+spec:
+  dns:
+    internal:
+      credentialsRef:
+        apiVersion: v1
+        kind: Secret
+        name: internal-domain-secret
+        namespace: garden
+      type: aws-route53
+      domain: internal.my-seed.example.com
+    defaults:
+    - credentialsRef:
+        apiVersion: v1
+        kind: Secret
+        name: default-domain-secret
+        namespace: garden
+      type: aws-route53
+      domain: shoots.my-seed.example.com
+```
+
+## Configuration for End Users
+
+As an end-user consuming a Gardener landscape, you work with a different set of resources. You interact with the virtual Garden cluster's API to manage your shoot clusters:
+
+<CardGroup cols={2}>
+  <Card title="Projects" icon="folder">
+    Namespaces in the Garden cluster that group shoots and control access. Every shoot belongs to a project.
+  </Card>
+  <Card title="SecretBindings / CredentialsBindings" icon="key">
+    References to infrastructure credentials used to create shoot clusters on a specific cloud provider.
+  </Card>
+  <Card title="Shoots" icon="seedling">
+    The primary resource — describes a Kubernetes cluster to be created and managed by Gardener.
+  </Card>
+  <Card title="OpenIDConnectPresets" icon="id-badge">
+    Cluster- or namespace-scoped presets that automatically inject OIDC configuration into newly created shoots.
+  </Card>
+</CardGroup>
+
+For a full overview of the resources available to end-users, see the [Gardener API Server documentation](../concepts/apiserver.md).

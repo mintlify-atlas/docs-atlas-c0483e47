@@ -1,0 +1,473 @@
+---
+title: "extensions.gardener.cloud/v1alpha1 API Reference"
+description: "Internal API for Gardener provider extensions: Infrastructure, Worker, ControlPlane, Network, DNSRecord, OperatingSystemConfig, Bastion, and more resources."
+---
+
+The `extensions.gardener.cloud/v1alpha1` API group contains the internal resources that Gardener creates in seed clusters when reconciling a Shoot. These resources are consumed by provider and network extensions (e.g., `gardener-extension-provider-aws`, `gardener-extension-networking-calico`) which watch for them and implement the actual cloud provider or network operations.
+
+<Note>
+  These resources are managed by Gardener internally and are created in seed cluster namespaces. You do not typically create or modify them directly — they are an implementation detail of how Gardener communicates with extensions.
+</Note>
+
+```bash
+# List extension resources in the seed cluster's shoot namespace
+kubectl get infrastructure,worker,controlplane,network -n shoot--garden-dev--my-shoot
+```
+
+## Resource types
+
+<AccordionGroup>
+
+  <Accordion title="Infrastructure">
+
+The `Infrastructure` resource is created by the gardenlet in the shoot's seed namespace when a Shoot is reconciled. The provider extension watches for `Infrastructure` resources and creates the underlying cloud infrastructure: VPCs, subnets, security groups, NAT gateways, etc.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The provider type (e.g., `aws`, `azure`, `gcp`). Used to route the resource to the correct extension.
+</ParamField>
+
+<ParamField path="spec.region" type="string" required>
+  The cloud region where infrastructure should be provisioned.
+</ParamField>
+
+<ParamField path="spec.credentialsRef" type="object" required>
+  Reference to the Secret containing cloud provider credentials.
+</ParamField>
+
+<ParamField path="spec.providerConfig" type="object">
+  Provider-specific infrastructure configuration (raw extension). The schema is defined by each provider extension.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Infrastructure
+metadata:
+  name: my-shoot
+  namespace: shoot--garden-dev--my-shoot
+spec:
+  type: aws
+  region: eu-west-1
+  credentialsRef:
+    apiVersion: v1
+    kind: Secret
+    name: cloudprovider
+    namespace: shoot--garden-dev--my-shoot
+  providerConfig:
+    apiVersion: aws.provider.extensions.gardener.cloud/v1alpha1
+    kind: InfrastructureConfig
+    networks:
+      vpc:
+        cidr: 10.250.0.0/16
+      zones:
+      - name: eu-west-1a
+        workers: 10.250.0.0/19
+        public: 10.250.32.0/20
+        internal: 10.250.48.0/20
+```
+
+  </Accordion>
+
+  <Accordion title="Worker">
+
+The `Worker` resource describes the desired state of the worker node pools for a shoot. The provider extension reconciles this resource by creating and managing machine deployments using the machine-controller-manager.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The provider type for the worker pools.
+</ParamField>
+
+<ParamField path="spec.region" type="string" required>
+  The cloud region for the worker nodes.
+</ParamField>
+
+<ParamField path="spec.pools" type="array" required>
+  List of worker pool definitions. Each pool specifies machine type, OS image, min/max count, zones, and provider-specific configuration.
+</ParamField>
+
+<ParamField path="spec.credentialsRef" type="object" required>
+  Reference to the Secret containing cloud provider credentials.
+</ParamField>
+
+<ParamField path="spec.infrastructureProviderStatus" type="object">
+  The provider status output from the `Infrastructure` resource (e.g., VPC ID, subnet IDs) needed for provisioning worker nodes.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Worker
+metadata:
+  name: my-shoot
+  namespace: shoot--garden-dev--my-shoot
+spec:
+  type: aws
+  region: eu-west-1
+  credentialsRef:
+    apiVersion: v1
+    kind: Secret
+    name: cloudprovider
+    namespace: shoot--garden-dev--my-shoot
+  pools:
+  - name: cpu-worker
+    minimum: 3
+    maximum: 5
+    machineType: m5.large
+    machineImage:
+      name: gardenlinux
+      version: 15.4.20220818
+    volume:
+      type: gp2
+      size: 20Gi
+    zones:
+    - eu-west-1a
+    - eu-west-1b
+```
+
+  </Accordion>
+
+  <Accordion title="ControlPlane">
+
+The `ControlPlane` resource instructs the provider extension to deploy provider-specific control plane components into the shoot's seed namespace. For example, the AWS provider extension deploys `cloud-controller-manager` and `csi-driver` components when it reconciles a `ControlPlane` resource.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The provider type.
+</ParamField>
+
+<ParamField path="spec.purpose" type="string">
+  Either `normal` (the main control plane) or `exposure` (for shoot API server exposure components).
+</ParamField>
+
+<ParamField path="spec.region" type="string" required>
+  The cloud region of the shoot cluster.
+</ParamField>
+
+<ParamField path="spec.credentialsRef" type="object" required>
+  Reference to the cloud provider credentials secret.
+</ParamField>
+
+<ParamField path="spec.providerConfig" type="object">
+  Provider-specific control plane configuration.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: ControlPlane
+metadata:
+  name: my-shoot
+  namespace: shoot--garden-dev--my-shoot
+spec:
+  type: aws
+  purpose: normal
+  region: eu-west-1
+  credentialsRef:
+    apiVersion: v1
+    kind: Secret
+    name: cloudprovider
+    namespace: shoot--garden-dev--my-shoot
+  providerConfig:
+    apiVersion: aws.provider.extensions.gardener.cloud/v1alpha1
+    kind: ControlPlaneConfig
+    storage:
+      managedDefaultClass: true
+```
+
+  </Accordion>
+
+  <Accordion title="Network">
+
+The `Network` resource represents the desired CNI (Container Network Interface) configuration for a shoot cluster. Network extensions (e.g., `gardener-extension-networking-calico`, `gardener-extension-networking-cilium`) watch for `Network` resources and deploy the network plugin into the shoot cluster.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The network plugin type (e.g., `calico`, `cilium`).
+</ParamField>
+
+<ParamField path="spec.podCIDR" type="string" required>
+  CIDR range for pod IP addresses.
+</ParamField>
+
+<ParamField path="spec.serviceCIDR" type="string" required>
+  CIDR range for service IP addresses.
+</ParamField>
+
+<ParamField path="spec.providerConfig" type="object">
+  Provider-specific network configuration (e.g., Calico or Cilium specific settings).
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Network
+metadata:
+  name: my-shoot
+  namespace: shoot--garden-dev--my-shoot
+spec:
+  type: calico
+  podCIDR: 100.96.0.0/11
+  serviceCIDR: 100.64.0.0/13
+  providerConfig:
+    apiVersion: calico.networking.extensions.gardener.cloud/v1alpha1
+    kind: NetworkConfig
+    backend: bird
+    ipam:
+      cidr: usePodCIDR
+      type: host-local
+```
+
+  </Accordion>
+
+  <Accordion title="OperatingSystemConfig">
+
+The `OperatingSystemConfig` (OSC) resource describes the desired OS-level configuration for worker nodes: systemd units, files to write to disk, and kubelet configuration. OS extensions (e.g., `gardener-extension-os-gardenlinux`, `gardener-extension-os-ubuntu`) reconcile OSC resources and produce the final cloud-init or ignition configuration applied to new nodes.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The OS type (e.g., `gardenlinux`, `ubuntu`, `flatcar`).
+</ParamField>
+
+<ParamField path="spec.purpose" type="string" required>
+  Either `provision` (applied during first-boot) or `reconcile` (applied to running nodes via the node-agent).
+</ParamField>
+
+<ParamField path="spec.units" type="array">
+  List of systemd unit definitions to configure on the node.
+</ParamField>
+
+<ParamField path="spec.files" type="array">
+  List of files to write to the node's filesystem, with content (inline or from a Secret) and permissions.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: OperatingSystemConfig
+metadata:
+  name: my-shoot-cpu-worker-provision
+  namespace: shoot--garden-dev--my-shoot
+spec:
+  type: gardenlinux
+  purpose: provision
+  units:
+  - name: containerd.service
+    enable: true
+  files:
+  - path: /etc/containerd/config.toml
+    permissions: 0644
+    content:
+      inline:
+        encoding: b64
+        data: <base64-encoded-config>
+```
+
+  </Accordion>
+
+  <Accordion title="DNSRecord">
+
+The `DNSRecord` resource represents a single DNS record that Gardener needs to create for a shoot cluster (e.g., for the API server endpoint or ingress). DNS extensions (e.g., `gardener-extension-provider-aws` for Route53, or dedicated DNS extensions) reconcile these records.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The DNS provider type (e.g., `aws-route53`, `azure-dns`, `google-clouddns`).
+</ParamField>
+
+<ParamField path="spec.name" type="string" required>
+  The DNS record name (fully qualified domain name).
+</ParamField>
+
+<ParamField path="spec.recordType" type="string" required>
+  The DNS record type: `A`, `AAAA`, or `CNAME`.
+</ParamField>
+
+<ParamField path="spec.values" type="array" required>
+  The record values (IP addresses for A/AAAA records, or hostname for CNAME records).
+</ParamField>
+
+<ParamField path="spec.credentialsRef" type="object" required>
+  Reference to the Secret containing DNS provider credentials.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: DNSRecord
+metadata:
+  name: my-shoot-kube-apiserver
+  namespace: shoot--garden-dev--my-shoot
+spec:
+  type: aws-route53
+  name: api.my-shoot.example.com
+  recordType: A
+  values:
+  - 203.0.113.42
+  credentialsRef:
+    apiVersion: v1
+    kind: Secret
+    name: cloudprovider
+    namespace: shoot--garden-dev--my-shoot
+```
+
+  </Accordion>
+
+  <Accordion title="Bastion">
+
+The `Bastion` resource in the extensions API group represents an SSH bastion host for accessing shoot worker nodes. When a user creates a `Bastion` in the `operations.gardener.cloud` API, Gardener creates a corresponding extensions `Bastion` in the seed cluster namespace, and the provider extension provisions the actual bastion VM.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The provider type for the bastion (e.g., `aws`, `gcp`, `azure`).
+</ParamField>
+
+<ParamField path="spec.userData" type="object">
+  Cloud-init user data for the bastion VM, specifying authorized SSH keys and initial setup.
+</ParamField>
+
+<ParamField path="spec.ingress" type="array">
+  List of allowed ingress IP blocks for SSH access to the bastion.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Bastion
+metadata:
+  name: example-bastion
+  namespace: shoot--garden-dev--my-shoot
+spec:
+  type: aws
+  userData:
+    secretRef:
+      name: bastion-user-data
+      namespace: shoot--garden-dev--my-shoot
+  ingress:
+  - ipBlock:
+      cidr: 203.0.113.0/32
+```
+
+  </Accordion>
+
+  <Accordion title="BackupBucket and BackupEntry">
+
+The extensions API group also contains `BackupBucket` and `BackupEntry` resources used by the gardenlet when reconciling the corresponding core API objects. Provider extensions watch these resources and create/manage the actual cloud storage buckets and container paths.
+
+### BackupBucket spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The cloud provider type for the backup storage.
+</ParamField>
+
+<ParamField path="spec.region" type="string" required>
+  The region where the bucket should be created.
+</ParamField>
+
+<ParamField path="spec.credentialsRef" type="object" required>
+  Reference to the Secret containing credentials for the backup storage provider.
+</ParamField>
+
+### BackupEntry spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The cloud provider type.
+</ParamField>
+
+<ParamField path="spec.region" type="string" required>
+  The region of the backup bucket.
+</ParamField>
+
+<ParamField path="spec.bucketName" type="string" required>
+  The name of the bucket (from the BackupBucket resource).
+</ParamField>
+
+<ParamField path="spec.credentialsRef" type="object" required>
+  Reference to the credentials Secret.
+</ParamField>
+
+  </Accordion>
+
+  <Accordion title="ContainerRuntime">
+
+The `ContainerRuntime` resource enables additional container runtimes on worker nodes, such as `gvisor` (gVisor sandbox) or `kata-containers`. Container runtime extensions watch for these resources and install the required components on worker nodes via the OperatingSystemConfig mechanism.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The container runtime type (e.g., `gvisor`, `kata-containers`).
+</ParamField>
+
+<ParamField path="spec.workerPool.name" type="string" required>
+  Name of the worker pool this container runtime configuration applies to.
+</ParamField>
+
+<ParamField path="spec.providerConfig" type="object">
+  Runtime-specific configuration.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: ContainerRuntime
+metadata:
+  name: my-shoot-cpu-worker-gvisor
+  namespace: shoot--garden-dev--my-shoot
+spec:
+  type: gvisor
+  workerPool:
+    name: cpu-worker
+    selector:
+      matchLabels:
+        worker.gardener.cloud/pool: cpu-worker
+```
+
+  </Accordion>
+
+  <Accordion title="Extension">
+
+The `Extension` resource is a generic hook that allows extensions to perform arbitrary operations during shoot reconciliation without requiring a dedicated resource type. Gardener creates an `Extension` resource for each entry in the Shoot's `spec.extensions` list, and the corresponding extension controller reconciles it.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The extension type, matching a registered `ControllerRegistration`.
+</ParamField>
+
+<ParamField path="spec.providerConfig" type="object">
+  Extension-specific configuration passed through from the Shoot's `spec.extensions[].providerConfig`.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Extension
+metadata:
+  name: my-shoot-foobar
+  namespace: shoot--garden-dev--my-shoot
+spec:
+  type: foobar
+  providerConfig:
+    apiVersion: foobar.extensions.gardener.cloud/v1alpha1
+    kind: FooBarConfig
+    foo: bar
+```
+
+  </Accordion>
+
+</AccordionGroup>

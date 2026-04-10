@@ -1,0 +1,328 @@
+---
+title: Creating and Managing Gardener Shoot Clusters
+description: Create and manage Shoot clusters in Gardener — covering the Shoot resource spec, worker pools, cloud profiles, cluster purposes, access, and hibernation.
+---
+
+A **Shoot** cluster is a fully managed Kubernetes cluster provisioned by Gardener on a cloud provider. Gardener handles the entire lifecycle — from infrastructure provisioning and control-plane deployment to ongoing maintenance, version updates, and monitoring. You interact with a Shoot by creating and modifying a `Shoot` resource in the Garden cluster.
+
+## The Shoot Resource
+
+A `Shoot` is a `core.gardener.cloud/v1beta1` custom resource that describes a desired Kubernetes cluster. The following YAML is adapted from the canonical example at `example/90-shoot.yaml`:
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Shoot
+metadata:
+  name: crazy-botany
+  namespace: garden-dev
+spec:
+  credentialsBindingName: my-provider-account
+  cloudProfile:
+    name: cloudprofile1
+  region: europe-central-1
+  purpose: evaluation  # testing | development | production | infrastructure
+  provider:
+    type: aws  # aws | azure | gcp | ...
+    infrastructureConfig:
+      # provider-specific infrastructure configuration
+    controlPlaneConfig:
+      # provider-specific control plane configuration
+    workers:
+    - name: cpu-worker
+      minimum: 3
+      maximum: 5
+      machine:
+        type: m5.large
+        image:
+          name: gardenlinux
+          version: 1312.2.0
+      volume:
+        type: gp2
+        size: 20Gi
+  kubernetes:
+    version: "1.30.0"
+  networking:
+    type: calico
+    ipFamilies:
+    - IPv4
+    pods: 100.96.0.0/11
+    nodes: 10.250.0.0/16
+    services: 100.64.0.0/13
+  maintenance:
+    timeWindow:
+      begin: 220000+0100
+      end: 230000+0100
+    autoUpdate:
+      kubernetesVersion: true
+      machineImageVersion: true
+  dns:
+    domain: crazy-botany.core.my-custom-domain.com
+```
+
+<Note>
+The `networking.pods` CIDR and `nodeCIDRMaskSize` are **immutable** — they cannot be changed after the cluster is created. Plan your IP ranges carefully before creation.
+</Note>
+
+## Worker Pools
+
+Worker pools define the groups of nodes in a Shoot. Each pool specifies a machine type, image, autoscaling bounds, and optional zone spread.
+
+```yaml
+spec:
+  provider:
+    workers:
+    - name: cpu-worker
+      minimum: 3
+      maximum: 5
+      maxSurge: 1
+      maxUnavailable: 0
+      machine:
+        type: m5.large
+        image:
+          name: gardenlinux
+          version: 1312.2.0
+      volume:
+        type: gp2
+        size: 20Gi
+      zones:
+      - europe-central-1a
+      - europe-central-1b
+      - europe-central-1c
+      updateStrategy: AutoRollingUpdate  # AutoRollingUpdate | AutoInPlaceUpdate | ManualInPlaceUpdate
+```
+
+<CardGroup cols={2}>
+  <Card title="AutoRollingUpdate" icon="rotate">
+    The default strategy. Nodes are replaced one by one in a rolling fashion, respecting `maxSurge` and `maxUnavailable`.
+  </Card>
+  <Card title="AutoInPlaceUpdate" icon="arrows-up-down">
+    Nodes are updated in-place without replacement. Requires the OS to support in-place updates. Alpha feature.
+  </Card>
+  <Card title="ManualInPlaceUpdate" icon="hand">
+    The user controls which nodes are updated by labeling them with `node.machine.sapcloud.io/selected-for-update=true`.
+  </Card>
+  <Card title="Multi-zone pools" icon="globe">
+    List multiple zones to distribute nodes. Gardener divides `minimum`, `maximum`, `maxSurge`, and `maxUnavailable` evenly across zones.
+  </Card>
+</CardGroup>
+
+### Cluster Autoscaler per Worker Pool
+
+You can override cluster-autoscaler knobs at the individual worker pool level:
+
+```yaml
+spec:
+  provider:
+    workers:
+    - name: cpu-worker
+      clusterAutoscaler:
+        scaleDownUtilizationThreshold: 0.5
+        scaleDownGpuUtilizationThreshold: 0.5
+        scaleDownUnneededTime: 30m
+        scaleDownUnreadyTime: 1h
+        maxNodeProvisionTime: 15m
+```
+
+## Cloud Profiles
+
+A `CloudProfile` is a cluster-scoped resource managed by Gardener operators. It describes the available machine types, machine images, Kubernetes versions, and regions for a given provider. When creating a Shoot you reference a `CloudProfile` by name:
+
+```yaml
+spec:
+  cloudProfile:
+    name: aws
+  region: eu-central-1
+```
+
+The `CloudProfile` drives which values are valid for `spec.provider.workers[].machine.type`, `.machine.image.name`, `.machine.image.version`, and `.kubernetes.version`.
+
+## Shoot Purposes
+
+The `.spec.purpose` field signals how the cluster will be used. Gardener adjusts behavior based on the purpose.
+
+<Tabs>
+  <Tab title="evaluation (default)">
+    For evaluation and experimentation. Supports optional addons such as `nginxIngress` and `kubernetesDashboard`.
+
+    ```yaml
+    spec:
+      purpose: evaluation
+    ```
+  </Tab>
+  <Tab title="development">
+    For development workloads. Similar to `evaluation` but without the addon eligibility.
+
+    ```yaml
+    spec:
+      purpose: development
+    ```
+  </Tab>
+  <Tab title="production">
+    For production workloads. Auto-scaling scale-down of the main ETCD is disabled to protect data availability.
+
+    ```yaml
+    spec:
+      purpose: production
+    ```
+  </Tab>
+  <Tab title="testing">
+    Lightweight clusters for CI or testing. No monitoring or logging stack is deployed in the control plane.
+
+    ```yaml
+    spec:
+      purpose: testing
+    ```
+  </Tab>
+  <Tab title="infrastructure">
+    Reserved for infrastructure-level clusters. Only allowed in the `garden` namespace.
+
+    ```yaml
+    spec:
+      purpose: infrastructure
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+Shoot addons (`nginxIngress`, `kubernetesDashboard`) are deprecated and will be forbidden starting with Kubernetes version 1.35.
+</Warning>
+
+## Accessing Shoot Clusters
+
+### Admin kubeconfig
+
+Use the `shoots/adminkubeconfig` subresource to obtain a short-lived kubeconfig with `cluster-admin` privileges:
+
+```bash
+export NAMESPACE=garden-my-namespace
+export SHOOT_NAME=my-shoot
+kubectl create \
+    -f <(printf '{"spec":{"expirationSeconds":600}}') \
+    --raw /apis/core.gardener.cloud/v1beta1/namespaces/${NAMESPACE}/shoots/${SHOOT_NAME}/adminkubeconfig | \
+    jq -r ".status.kubeconfig" | \
+    base64 -d
+```
+
+The returned kubeconfig uses a short-lived client certificate that must be renewed before expiry.
+
+### Viewer kubeconfig
+
+For read-only access, use the `shoots/viewerkubeconfig` subresource instead:
+
+```bash
+kubectl create \
+    -f <(printf '{"spec":{"expirationSeconds":600}}') \
+    --raw /apis/core.gardener.cloud/v1beta1/namespaces/${NAMESPACE}/shoots/${SHOOT_NAME}/viewerkubeconfig | \
+    jq -r ".status.kubeconfig" | \
+    base64 -d
+```
+
+Viewer kubeconfigs grant read access to all APIs except `Secrets` and resources configured in `spec.kubernetes.kubeAPIServer.encryptionConfig`.
+
+<Tip>
+The [`gardenctl-v2`](https://github.com/gardener/gardenctl-v2) CLI tool simplifies targeting Shoot clusters. It automatically manages kubeconfig download and certificate renewal via the [gardenlogin](https://github.com/gardener/gardenlogin) plugin.
+</Tip>
+
+## Shoot Status and Conditions
+
+The Shoot status reflects the health and current operation of the cluster.
+
+### Conditions
+
+| Condition | Description |
+|-----------|-------------|
+| `APIServerAvailable` | Whether the shoot's `kube-apiserver` is reachable |
+| `ControlPlaneHealthy` | Whether all control plane components are healthy |
+| `EveryNodeReady` | Whether all worker nodes are ready |
+| `ObservabilityComponentsHealthy` | Whether monitoring/logging components are healthy |
+| `SystemComponentsHealthy` | Whether system components in `kube-system` are healthy |
+
+Conditions use a threshold mechanism: if a check fails, the condition first moves to `Processing`. Only after the threshold duration (configurable in `GardenletConfiguration`) does it transition to `False`.
+
+### Constraints
+
+<Accordion title="HibernationPossible">
+Indicates whether the Shoot can be safely hibernated. A `False` value means that user-deployed webhooks may interfere with the wakeup process (e.g., webhooks with `failurePolicy: Fail` targeting critical resources like Pods or Nodes).
+</Accordion>
+
+<Accordion title="MaintenancePreconditionsSatisfied">
+Indicates whether preconditions for safe maintenance operations are met. A `False` value means webhooks may interfere with node rolling updates.
+</Accordion>
+
+<Accordion title="CACertificateValiditiesAcceptable">
+Present when at least one CA certificate expires in less than one year. Consider performing a CA rotation if this constraint appears.
+</Accordion>
+
+<Accordion title="CRDsWithProblematicConversionWebhooks">
+Indicates a CRD with multiple stored versions and a conversion webhook. This can break reconciliation in some scenarios.
+</Accordion>
+
+### Status Label
+
+Shoots are automatically labeled with `shoot.gardener.cloud/status`. Possible values: `healthy`, `progressing`, `unhealthy`, or `unknown`.
+
+## Maintenance
+
+Gardener runs one maintenance operation per day within a configurable time window.
+
+```yaml
+spec:
+  maintenance:
+    timeWindow:
+      begin: 220000+0100   # 10 PM UTC+1
+      end: 230000+0100     # 11 PM UTC+1
+    autoUpdate:
+      kubernetesVersion: true
+      machineImageVersion: true
+    autoRotation:
+      credentials:
+        observability:
+          rotationPeriod: 168h  # 7 days
+        sshKeypair:
+          rotationPeriod: 168h
+        etcdEncryptionKey:
+          rotationPeriod: 168h
+```
+
+<Warning>
+There is no guarantee that a maintenance operation that starts a node roll-out will finish **within** the time window. For large clusters, rolling updates can take several hours.
+</Warning>
+
+To queue an operation for the next maintenance window without triggering it immediately, annotate the Shoot:
+
+```bash
+kubectl -n garden-dev annotate shoot my-shoot \
+  maintenance.gardener.cloud/operation=rotate-ca-start
+```
+
+## Hibernation
+
+Hibernation scales the cluster's worker nodes and control plane to zero, eliminating IaaS costs while preserving the cluster state in etcd.
+
+<Steps>
+  <Step title="Hibernate manually">
+    ```bash
+    kubectl patch shoot -n $NAMESPACE $SHOOT_NAME \
+      -p '{"spec":{"hibernation":{"enabled": true}}}'
+    ```
+  </Step>
+  <Step title="Wake up manually">
+    ```bash
+    kubectl patch shoot -n $NAMESPACE $SHOOT_NAME \
+      -p '{"spec":{"hibernation":{"enabled": false}}}'
+    ```
+  </Step>
+  <Step title="Configure a schedule">
+    ```yaml
+    spec:
+      hibernation:
+        enabled: false
+        schedules:
+        - start: "0 20 * * *"   # Hibernate at 8PM
+          end: "0 6 * * *"      # Wake up at 6AM
+          location: "America/Los_Angeles"
+    ```
+  </Step>
+</Steps>
+
+Hibernation does not delete persistent volumes or the etcd state. The cluster's workload is paused and can be resumed by waking up the cluster.

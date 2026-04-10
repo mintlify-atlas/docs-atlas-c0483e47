@@ -1,0 +1,346 @@
+---
+title: "Registering Extensions in Gardener Landscapes"
+description: "How to register extension controllers using Extension, ControllerRegistration, and ControllerDeployment resources and configure deployment policies."
+---
+
+Before Gardener can use an extension controller to handle provider-specific tasks, the extension must be registered with the system. Registration tells Gardener what resource kinds and types the extension handles, where to find its Helm chart, and how to deploy it. The preferred registration mechanism is the `Extension` resource in the `operator.gardener.cloud` group, which the `gardener-operator` uses to automate the full registration lifecycle.
+
+## The `Extension` resource
+
+`Extension` resources are created in the garden runtime cluster and serve as the single source of truth for all deployment aspects of an extension — admission, controller deployment to the garden runtime, and controller deployment to seed clusters.
+
+When `gardener-operator` processes an `Extension`, it:
+1. Deploys the extension admission component to the garden runtime cluster (if configured)
+2. Creates corresponding `ControllerRegistration` and `ControllerDeployment` resources in the virtual garden cluster
+3. These resources then instruct `gardenlet` to install the extension controller on appropriate seed clusters
+
+Here is a complete `Extension` resource example for a local provider:
+
+```yaml
+apiVersion: operator.gardener.cloud/v1alpha1
+kind: Extension
+metadata:
+  name: provider-local
+spec:
+  resources:
+  - kind: BackupBucket
+    type: local
+  - kind: BackupEntry
+    type: local
+  - kind: DNSRecord
+    type: local
+  - kind: Infrastructure
+    type: local
+  - kind: ControlPlane
+    type: local
+  - kind: Worker
+    type: local
+  deployment:
+    admission:
+      runtimeCluster:
+        helm:
+          ociRepository:
+            ref: registry.example.com/gardener/extensions/local/admission-runtime:v1.0.0
+      virtualCluster:
+        helm:
+          ociRepository:
+            ref: registry.example.com/gardener/extensions/local/adission-application:v1.0.0
+      values: {}
+    extension:
+      helm:
+          ociRepository:
+            ref: registry.example.com/gardener/extensions/local/extension:v1.0.0
+      values:
+         controllers:
+           dnsrecord:
+             concurrentSyncs: 20
+      runtimeClusterValues:
+        controllers:
+          dnsrecord:
+            concurrentSyncs: 1
+```
+
+### Extension status conditions
+
+Operators can monitor `Extension` resources to check whether extensions are in use and installed successfully:
+
+```yaml
+status:
+  conditions:
+  - lastTransitionTime: "2025-03-12T13:46:51Z"
+    lastUpdateTime: "2025-03-12T13:46:51Z"
+    message: Extension required for kinds [DNSRecord]
+    reason: ExtensionRequired
+    status: "True"
+    type: RequiredRuntime
+  - lastTransitionTime: "2025-01-20T10:39:47Z"
+    lastUpdateTime: "2025-01-20T10:39:47Z"
+    message: Extension has required ControllerInstallations for seed clusters
+    reason: RequiredControllerInstallation
+    status: "True"
+    type: RequiredVirtual
+  - lastTransitionTime: "2025-04-03T06:42:37Z"
+    lastUpdateTime: "2025-04-03T06:42:37Z"
+    message: Extension has been reconciled successfully
+    reason: ReconcileSuccessful
+    status: "True"
+    type: Installed
+```
+
+## `ControllerRegistration` and `ControllerDeployment`
+
+In the virtual garden cluster, the underlying registration objects are `ControllerRegistration` and `ControllerDeployment`. These are typically created automatically by `gardener-operator` from `Extension` resources, but understanding their structure is useful for advanced use cases.
+
+<Note>
+Before the `Extension` resource was introduced, `ControllerRegistration` and `ControllerDeployment` were the only way to register extensions. They are now implementation details managed by `gardener-operator` and should be treated as Gardener-internal objects for most use cases.
+</Note>
+
+```yaml
+apiVersion: core.gardener.cloud/v1
+kind: ControllerDeployment
+metadata:
+  name: provider-local
+helm:
+  ociRepository:
+    ref: registry.example.com/gardener/extensions/local/extension:v1.0.0
+  values:
+    controllers:
+      dnsrecord:
+        concurrentSyncs: 20
+---
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerRegistration
+metadata:
+  name: provider-local
+spec:
+  deployment:
+    deploymentRefs:
+    - name: provider-local
+  resources:
+  - kind: BackupBucket
+    type: local
+  - kind: BackupEntry
+    type: local
+  - kind: DNSRecord
+    type: local
+  - kind: Infrastructure
+    type: local
+  - kind: ControlPlane
+    type: local
+  - kind: Worker
+    type: local
+```
+
+This tells Gardener that the `provider-local` extension handles `BackupBucket`, `BackupEntry`, `DNSRecord`, `Infrastructure`, `ControlPlane`, and `Worker` resources of type `local`.
+
+## `ControllerInstallation`: deploying to seeds
+
+Once `ControllerRegistration` and `ControllerDeployment` resources exist, `gardener-controller-manager` automatically determines which extension controllers are needed on which seed clusters and creates `ControllerInstallation` resources accordingly:
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerInstallation
+metadata:
+  name: provider-local
+spec:
+  deploymentRef:
+    name: provider-local
+  registrationRef:
+    name: provider-local
+  seedRef:
+    name: local-1
+```
+
+This expresses that the `provider-local` extension must run on seed cluster `local-1`. `gardenlet` picks up this resource and installs the controller using the referenced `ControllerDeployment`. Installations are also automatically deleted when an extension is no longer required on a seed (for example, after all shoots using it have been deleted).
+
+## Helm chart references
+
+Both `Extension` and `ControllerDeployment` resources must reference an OCI Helm chart. Several reference formats are supported:
+
+```yaml
+helm:
+  ociRepository:
+    # Full ref with tag or digest, or both
+    ref: registry.example.com/foo:1.0.0@sha256:abc
+---
+helm:
+  ociRepository:
+    # Repository and tag
+    repository: registry.example.com
+    tag: 1.0.0
+---
+helm:
+  ociRepository:
+    # Repository and digest (recommended for cache stability)
+    repository: registry.example.com
+    digest: sha256:abc
+```
+
+<Tip>
+Always specify a digest in your OCI reference. Without a digest, Gardener must fetch the manifest on every reconciliation to compare digests with the local cache, which adds latency and load.
+</Tip>
+
+### Private registries
+
+To pull from a private registry, reference a pull secret in the `garden` namespace:
+
+```yaml
+helm:
+  ociRepository:
+    repository: registry.example.com
+    tag: 1.0.0
+    pullSecretRef:
+      name: my-pull-secret
+```
+
+The pull secret must contain a `.dockerconfigjson` key:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-pull-secret
+  namespace: garden
+  labels:
+    gardener.cloud/role: helm-pull-secret
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: <base64-encoded-docker-config-json>
+```
+
+For registries with custom CA certificates, add a CA bundle secret:
+
+```yaml
+helm:
+  ociRepository:
+    repository: registry.example.com
+    tag: 1.0.0
+    caBundleSecretRef:
+      name: my-ca-bundle
+    pullSecretRef:
+      name: my-pull-secret
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-ca-bundle
+  namespace: garden
+  labels:
+    gardener.cloud/role: oci-ca-bundle
+type: Opaque
+data:
+  bundle.crt: <base64-encoded-ca-bundle>
+```
+
+## Helm values injection
+
+When deploying extension Helm charts, Gardener injects additional properties at the root level so charts can access information about the garden and seed environment.
+
+**For garden deployments:**
+
+```yaml
+gardener:
+  runtimeCluster:
+    enabled: true
+    priorityClassName: <priority-class-name-for-extension>
+```
+
+**For seed deployments:**
+
+```yaml
+gardener:
+  version: <gardener-version>
+  garden:
+    clusterIdentity: <uuid-of-gardener-installation>
+    genericKubeconfigSecretName: <generic-garden-kubeconfig-secret-name>
+  seed:
+    name:             <seed-name>
+    clusterIdentity:  <seed-cluster-identity>
+    annotations:      <seed-annotations>
+    labels:           <seed-labels>
+    provider:         <seed-provider-type>
+    region:           <seed-region>
+    volumeProvider:   <seed-first-volume-provider>
+    volumeProviders:  <seed-volume-providers>
+    ingressDomain:    <seed-ingress-domain>
+    protected:        <seed-protected-taint>
+    visible:          <seed-visible-setting>
+    taints:           <seed-taints>
+    networks:         <seed-networks>
+    blockCIDRs:       <seed-networks-blockCIDRs>
+    spec:             <seed-spec>
+  gardenlet:
+    featureGates: <gardenlet-feature-gates>
+```
+
+## Deployment policies
+
+The deployment policy controls when Gardener deploys an extension controller to seed clusters:
+
+<AccordionGroup>
+  <Accordion title="OnDemand (default)">
+    Gardener dynamically determines whether the extension is required on a given seed (based on `Shoot` resources and other factors) and deploys or removes it accordingly.
+  </Accordion>
+  <Accordion title="Always">
+    The extension controller is deployed to all seed clusters regardless of whether any shoot currently requires it. This minimizes startup latency when new shoots are created and is useful for adding components to all seeds by default.
+  </Accordion>
+  <Accordion title="AlwaysExceptNoShoots">
+    Similar to `Always`, but the extension is not deployed to seeds that have no shoots. It is removed from a seed after the last shoot is deleted.
+  </Accordion>
+</AccordionGroup>
+
+## Per-resource configuration options
+
+The `spec.resources[]` entries in an `Extension` support additional configuration:
+
+```yaml
+apiVersion: operator.gardener.cloud/v1alpha1
+kind: Extension
+metadata:
+  name: extension-foo
+spec:
+  resources:
+  - kind: Extension
+    type: foo
+    primary: true
+    autoEnable:
+    - shoot
+    clusterCompatibility:
+    - seed
+    - shoot
+    reconcileTimeout: 30s
+    lifecycle:
+      reconcile: AfterKubeAPIServer
+      delete: BeforeKubeAPIServer
+      migrate: BeforeKubeAPIServer
+```
+
+**Key fields:**
+
+- `autoEnable`: When set to `[shoot]`, the extension is created by default for all shoots (unless the shoot opts out). When set to `[seed, shoot]`, it can be enabled for both seeds and shoots.
+- `reconcileTimeout`: How long Gardener waits for the extension to finish reconciling before treating the operation as timed out.
+- `primary`: Whether this controller is the primary (and only) controller responsible for the lifecycle of this resource type. Exactly one primary controller must exist per kind/type combination.
+
+### Extension lifecycle
+
+The `lifecycle` field controls when Gardener acts on an `Extension` resource relative to other shoot flow steps:
+
+<Tabs>
+  <Tab title="reconcile">
+    `AfterKubeAPIServer` (default): The extension is reconciled after `kube-apiserver` is ready. During hibernation, the opposite applies — it reconciles before `kube-apiserver` scales to zero.
+
+    `AfterWorker`: The extension reconciles after workers are deployed. Useful for extensions that deploy workloads into the shoot control plane and need worker nodes to be available.
+  </Tab>
+  <Tab title="delete">
+    `BeforeKubeAPIServer` (default): The extension resource is deleted before `kube-apiserver` is destroyed during shoot deletion.
+  </Tab>
+  <Tab title="migrate">
+    `BeforeKubeAPIServer` (default): During control plane migration, the extension resource is migrated before `kube-apiserver` is destroyed in the source cluster.
+  </Tab>
+</Tabs>
+
+<Warning>
+The `primary` field cannot be changed after an `Extension` resource is created. There must be exactly one primary controller for every registered kind/type combination.
+</Warning>

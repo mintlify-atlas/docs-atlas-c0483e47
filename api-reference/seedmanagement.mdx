@@ -1,0 +1,169 @@
+---
+title: "seedmanagement.gardener.cloud API Group Reference"
+description: "Reference for seedmanagement.gardener.cloud/v1alpha1: Gardenlet and ManagedSeed resources for declarative gardenlet deployment and seed registration."
+---
+
+The `seedmanagement.gardener.cloud/v1alpha1` API group provides resources for managing the lifecycle of gardenlets and seeds declaratively. Instead of manually deploying and configuring a gardenlet, you declare the desired state using `Gardenlet` or `ManagedSeed` resources and let Gardener handle the deployment.
+
+```bash
+# List all resource types in the seedmanagement API group
+kubectl api-resources --api-group=seedmanagement.gardener.cloud
+```
+
+## Resource types
+
+<AccordionGroup>
+
+  <Accordion title="Gardenlet">
+
+The `Gardenlet` resource allows the gardener-operator (or a parent gardenlet) to deploy a gardenlet into a target seed cluster declaratively. You create a `Gardenlet` resource in the `garden` namespace, and the operator handles the Helm-based deployment of the gardenlet into the target cluster.
+
+This resource is intended for unmanaged seed clusters — clusters that already exist and are not themselves Shoot clusters.
+
+### Key spec fields
+
+<ParamField path="spec.deployment.helm.ociRepository.repository" type="string">
+  OCI repository URL for the gardenlet Helm chart (e.g., `europe-docker.pkg.dev/gardener-project/releases/charts/gardener/gardenlet`).
+</ParamField>
+
+<ParamField path="spec.deployment.replicaCount" type="integer">
+  Number of gardenlet replicas to run in the seed cluster. Defaults to 2 for high availability.
+</ParamField>
+
+<ParamField path="spec.deployment.resources" type="object">
+  CPU and memory resource requests and limits for the gardenlet pods.
+</ParamField>
+
+<ParamField path="spec.config" type="object" required>
+  The `GardenletConfiguration` resource embedded inline. Specifies the gardenlet's connection to the garden cluster, seed selector, feature gates, and other settings.
+</ParamField>
+
+<ParamField path="spec.kubeconfigSecretRef.name" type="string">
+  Name of a Secret in the `garden` namespace containing a kubeconfig for the target seed cluster. Used by gardener-operator for the initial deployment. After the gardenlet bootstraps, it manages its own credentials.
+</ParamField>
+
+### Status
+
+The `status` field reflects the most recently observed state of the gardenlet deployment, including conditions such as whether the gardenlet is reconciled, healthy, and connected to the garden cluster.
+
+### Bootstrap mechanisms
+
+The `GardenletConfig.bootstrap` field controls how the gardenlet authenticates to the garden cluster on first startup:
+
+| Value | Behavior |
+|---|---|
+| `ServiceAccount` | A ServiceAccount token is created in the garden cluster and used for bootstrapping |
+| `BootstrapToken` | A bootstrap token is used (similar to `kubeadm` node bootstrap) |
+| `None` | No bootstrapping; a kubeconfig must be provided manually |
+
+### Example
+
+```yaml
+apiVersion: seedmanagement.gardener.cloud/v1alpha1
+kind: Gardenlet
+metadata:
+  name: my-seed
+  namespace: garden
+spec:
+  deployment:
+    helm:
+      ociRepository:
+        repository: europe-docker.pkg.dev/gardener-project/releases/charts/gardener/gardenlet
+    replicaCount: 2
+    revisionHistoryLimit: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 100Mi
+      limits:
+        cpu: 2000m
+        memory: 512Mi
+    podLabels:
+      foo: bar
+  config:
+    apiVersion: gardenlet.config.gardener.cloud/v1alpha1
+    kind: GardenletConfiguration
+    # See 20-componentconfig-gardenlet.yaml for full configuration options
+# For the first deployment, reference a kubeconfig secret for the target cluster:
+# kubeconfigSecretRef:
+#   name: my-seed-kubeconfig
+```
+
+<Note>
+  The `Gardenlet` resource must be created in the `garden` namespace. gardener-operator watches this namespace for `Gardenlet` resources and handles deployment accordingly.
+</Note>
+
+  </Accordion>
+
+  <Accordion title="ManagedSeed">
+
+A `ManagedSeed` registers an existing Shoot cluster as a Seed cluster. Rather than managing a separate infrastructure cluster as a seed, you can use one of your Shoot clusters to serve as a seed by creating a `ManagedSeed` resource. Gardener then installs a gardenlet into that Shoot cluster and registers it as a Seed.
+
+This is the recommended approach for multi-seed landscapes where each seed is itself a managed Kubernetes cluster.
+
+### Key spec fields
+
+<ParamField path="spec.shoot.name" type="string" required>
+  Name of the Shoot (in the `garden` namespace) that should become a Seed.
+</ParamField>
+
+<ParamField path="spec.gardenlet.bootstrap" type="string">
+  Bootstrap mechanism for the gardenlet deployed into the ManagedSeed's shoot cluster. One of `ServiceAccount`, `BootstrapToken`, or `None`.
+</ParamField>
+
+<ParamField path="spec.gardenlet.mergeWithParent" type="boolean">
+  If `true`, the deployment parameters and GardenletConfiguration of the parent gardenlet are merged with those specified here. This allows child gardenlets to inherit configuration from their parent.
+</ParamField>
+
+<ParamField path="spec.gardenlet.deployment" type="object">
+  Deployment parameters for the gardenlet: replica count, image, resource limits, annotations, and more.
+</ParamField>
+
+<ParamField path="spec.gardenlet.config" type="object">
+  Inline `GardenletConfiguration` resource for the gardenlet deployed into the shoot cluster.
+</ParamField>
+
+### ManagedSeedSet
+
+The `ManagedSeedSet` resource (also in this API group) allows you to manage a set of ManagedSeeds with a common template, similar to how a `ReplicaSet` manages Pods. It ensures a specified number of ManagedSeeds are running at any given time.
+
+### Example
+
+```yaml
+apiVersion: seedmanagement.gardener.cloud/v1alpha1
+kind: ManagedSeed
+metadata:
+  name: my-managed-seed
+  namespace: garden
+spec:
+  shoot:
+    name: crazy-botany
+  gardenlet:
+    bootstrap: ServiceAccount
+    mergeWithParent: true
+    # deployment:
+    #   replicaCount: 2
+    #   image:
+    #     repository: europe-docker.pkg.dev/gardener-project/releases/gardener/gardenlet
+    #     tag: latest
+    #     pullPolicy: IfNotPresent
+    #   resources:
+    #     requests:
+    #       cpu: 100m
+    #       memory: 100Mi
+    config:
+      apiVersion: gardenlet.config.gardener.cloud/v1alpha1
+      kind: GardenletConfiguration
+```
+
+<Warning>
+  The `ManagedSeed` resource must be created in the `garden` namespace. The referenced Shoot must also be in the `garden` namespace and must already exist.
+</Warning>
+
+<Tip>
+  Use `mergeWithParent: true` in most cases. This ensures the ManagedSeed's gardenlet inherits garden cluster connection details from the parent gardenlet, avoiding the need to duplicate configuration.
+</Tip>
+
+  </Accordion>
+
+</AccordionGroup>

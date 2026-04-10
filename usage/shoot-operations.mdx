@@ -1,0 +1,288 @@
+---
+title: Operating Shoot Clusters in Gardener
+description: Trigger Shoot operations via annotations, perform Kubernetes and OS upgrades, rotate credentials, force-delete clusters, and manage worker pool rollouts.
+---
+
+Gardener provides a set of explicit operations that can be triggered by annotating a Shoot resource. This mechanism enables you to initiate behavior — like immediate reconciliation, credential rotation, or force-deletion — without changing the Shoot specification. Once the controller processes the annotation, it is automatically removed.
+
+## Triggering Operations via Annotations
+
+All operations are triggered by annotating the Shoot in the Garden cluster:
+
+```bash
+kubectl -n garden-<project-name> annotate shoot <shoot-name> gardener.cloud/operation=<operation>
+```
+
+<CardGroup cols={2}>
+  <Card title="reconcile" icon="rotate">
+    Forces immediate reconciliation, even outside the maintenance window or when `confineSpecUpdateRollout` is set.
+  </Card>
+  <Card title="maintain" icon="wrench">
+    Triggers an immediate maintenance cycle, applying version updates and other maintenance tasks now.
+  </Card>
+  <Card title="retry" icon="arrows-rotate">
+    Retries a reconciliation that previously ended in `Failed` state.
+  </Card>
+  <Card title="force-in-place-update" icon="bolt">
+    Forces an update for worker pools using `AutoInPlaceUpdate` or `ManualInPlaceUpdate` strategies when blocked.
+  </Card>
+</CardGroup>
+
+### Running Operations in Parallel
+
+Multiple compatible operations can be chained with `;`:
+
+```bash
+kubectl -n garden-<project-name> annotate shoot <shoot-name> \
+  gardener.cloud/operation="rotate-ssh-keypair;rotate-ca-start"
+```
+
+Operations that can run in parallel include `reconcile`, `rotate-ca-start`, `rotate-ca-complete`, `rotate-ssh-keypair`, `rotate-observability-credentials`, `rotate-etcd-encryption-key`, `rotate-serviceaccount-key-start`, `rotate-serviceaccount-key-complete`, and others.
+
+## Kubernetes Version Upgrades
+
+Kubernetes version upgrades are performed by changing `.spec.kubernetes.version` (for the control plane) or `.spec.provider.workers[].kubernetes.version` (per worker pool).
+
+```yaml
+spec:
+  kubernetes:
+    version: "1.30.0"   # Bump to upgrade the control plane
+  provider:
+    workers:
+    - name: cpu-worker
+      kubernetes:
+        version: "1.29.5"  # Worker pool can trail the control plane by one minor version
+```
+
+<Warning>
+Downgrading the Kubernetes version is not supported. You can only upgrade to a higher version.
+</Warning>
+
+### Update Strategies for Worker Pools
+
+The `.spec.provider.workers[].updateStrategy` field controls how nodes are updated when a rolling change is triggered.
+
+<Tabs>
+  <Tab title="AutoRollingUpdate (default)">
+    Nodes are replaced sequentially. The existing workload is drained and rescheduled to new nodes, respecting `PodDisruptionBudget`s.
+
+    ```yaml
+    spec:
+      provider:
+        workers:
+        - name: cpu-worker
+          maxSurge: 1
+          maxUnavailable: 0
+          updateStrategy: AutoRollingUpdate
+    ```
+  </Tab>
+  <Tab title="AutoInPlaceUpdate">
+    The upgrade is performed without replacing the underlying machines. The machine-controller-manager orchestrates the update. Requires OS support in the `CloudProfile`.
+
+    ```yaml
+    spec:
+      provider:
+        workers:
+        - name: cpu-worker
+          maxSurge: 0
+          maxUnavailable: 2
+          updateStrategy: AutoInPlaceUpdate
+    ```
+  </Tab>
+  <Tab title="ManualInPlaceUpdate">
+    The user selects which nodes to update by labeling them. Gardener labels candidate nodes with `node.machine.sapcloud.io/candidate-for-update`.
+
+    ```yaml
+    spec:
+      provider:
+        workers:
+        - name: cpu-worker
+          updateStrategy: ManualInPlaceUpdate
+    ```
+
+    To select a node for update:
+
+    ```bash
+    kubectl label node <node-name> node.machine.sapcloud.io/selected-for-update=true
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+Switching from `AutoRollingUpdate` to an in-place strategy (and vice versa) is not allowed. You can switch between `AutoInPlaceUpdate` and `ManualInPlaceUpdate`.
+</Note>
+
+### Rolling Update Triggers
+
+A rolling replacement of worker nodes is triggered when any of the following spec fields change:
+
+- `.spec.kubernetes.version` (except patch versions)
+- `.spec.provider.workers[].machine.image.name` or `.machine.image.version`
+- `.spec.provider.workers[].machine.type`
+- `.spec.provider.workers[].volume.type` or `.volume.size`
+- `.spec.provider.workers[].cri.name`
+- `.spec.provider.workers[].kubernetes.version` (except patch versions)
+- `.spec.provider.workers[].kubernetes.kubelet.*` (e.g., `kubeReserved`, `cpuManagerPolicy`)
+- Credential rotation initiation (CA rotation or ServiceAccount key rotation)
+
+Patch-version-only Kubernetes updates do **not** trigger a full node replacement — only the `kubelet` is restarted in-place.
+
+### machine-controller-manager Tuning
+
+Fine-tune how the machine-controller-manager handles nodes per worker pool:
+
+```yaml
+spec:
+  provider:
+    workers:
+    - name: cpu-worker
+      machineControllerManager:
+        machineDrainTimeout: 2h        # Grace period before force-deleting a node being drained
+        machineHealthTimeout: 10m      # Time before a non-ready node is replaced
+        machineCreationTimeout: 20m    # Time before a stuck provisioning is retried
+        maxEvictRetries: 10            # Max eviction retries per pod during drain
+        nodeConditions:
+        - ReadonlyFilesystem
+        - KernelDeadlock
+        - DiskPressure
+```
+
+## Credentials Rotation
+
+Gardener generates several internal credentials for a Shoot cluster. These credentials have no automatic rotation (except when configured in `.spec.maintenance.autoRotation`), and rotating them is the responsibility of the end-user.
+
+### Rotate All Credentials at Once
+
+<Steps>
+  <Step title="Start the rotation">
+    This triggers phase one for all credentials: new keys/CAs are generated and added alongside the old ones.
+
+    ```bash
+    kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+      gardener.cloud/operation=rotate-credentials-start
+    ```
+  </Step>
+  <Step title="Update external API clients">
+    After phase one completes, update all external API clients (kubeconfigs on developer machines, CI systems) to use the new credentials.
+  </Step>
+  <Step title="Complete the rotation">
+    This removes the old credentials.
+
+    ```bash
+    kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+      gardener.cloud/operation=rotate-credentials-complete
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+To avoid rolling all worker nodes immediately, use `rotate-credentials-start-without-workers-rollout` in step 1, then roll worker pools individually later with `rotate-rollout-workers=<pool1-name>[,<pool2-name>]`.
+</Tip>
+
+### Certificate Authorities (CA Rotation)
+
+CA rotation happens in two phases with a mandatory intermediate step for updating external clients.
+
+<Steps>
+  <Step title="Start CA rotation">
+    New CAs are created and added to the bundle alongside the old CAs. Client certificates are re-issued. Worker nodes are rolled out.
+
+    ```bash
+    kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+      gardener.cloud/operation=rotate-ca-start
+    ```
+
+    Status moves to `Prepared` once complete.
+  </Step>
+  <Step title="Update API clients">
+    Update all kubeconfigs and API clients to use the new CA bundle from the `<shoot-name>.ca-cluster` ConfigMap in the project namespace.
+  </Step>
+  <Step title="Complete CA rotation">
+    The old CAs are dropped from the bundle; server certificates are re-issued.
+
+    ```bash
+    kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+      gardener.cloud/operation=rotate-ca-complete
+    ```
+  </Step>
+</Steps>
+
+Check rotation status:
+
+```bash
+kubectl -n <shoot-namespace> get shoot <shoot-name> \
+  -o jsonpath='{.status.credentials.rotation.certificateAuthorities}'
+```
+
+### ETCD Encryption Key Rotation
+
+```bash
+# Start rotation (creates new key, rewrites all Secrets with the new key)
+kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+  gardener.cloud/operation=rotate-etcd-encryption-key
+```
+
+The rotation completes in two phases automatically. Phase `Preparing` rewrites all Secrets with the new key; phase `Completing` removes the old key.
+
+### ServiceAccount Token Signing Key Rotation
+
+```bash
+# Start rotation
+kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+  gardener.cloud/operation=rotate-serviceaccount-key-start
+
+# After updating all out-of-cluster clients using ServiceAccount tokens:
+kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+  gardener.cloud/operation=rotate-serviceaccount-key-complete
+```
+
+<Warning>
+In phase one of the ServiceAccount key rotation, **all worker nodes will be rolled out** to ensure pods receive new tokens. Use `rotate-serviceaccount-key-start-without-workers-rollout` to defer this.
+</Warning>
+
+### SSH Key Pair Rotation
+
+The SSH key pair is used for emergency node access via `gardenctl ssh`.
+
+```bash
+kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+  gardener.cloud/operation=rotate-ssh-keypair
+```
+
+The new key is propagated to all nodes while the old key remains valid. The old key is removed on the next rotation. The private key is stored in the `<shoot-name>.ssh-keypair` Secret in the project namespace.
+
+### Observability (Plutono/Prometheus) Credentials
+
+```bash
+kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+  gardener.cloud/operation=rotate-observability-credentials
+```
+
+Credentials are stored in the `<shoot-name>.monitoring` Secret in the project namespace.
+
+## Force Deletion
+
+When a Shoot cannot be deleted normally due to stuck resources, you can force-delete it if the following conditions are met:
+
+- The Shoot has a deletion timestamp (i.e., `kubectl delete shoot` was already run).
+- The Shoot status contains one of: `ERR_CLEANUP_CLUSTER_RESOURCES`, `ERR_CONFIGURATION_PROBLEM`, `ERR_INFRA_DEPENDENCIES`, `ERR_INFRA_UNAUTHENTICATED`, or `ERR_INFRA_UNAUTHORIZED`.
+
+```bash
+kubectl -n <shoot-namespace> annotate shoot <shoot-name> \
+  confirmation.gardener.cloud/force-deletion=true
+```
+
+<Warning>
+Force deletion only cleans up the Gardener control plane metadata. **Cloud provider resources (VMs, load balancers, volumes, networks) are NOT deleted automatically.** You must clean up your IaaS account manually to avoid orphaned resources and costs.
+</Warning>
+
+## Restarting systemd Services on Worker Nodes
+
+You can trigger a restart of specific systemd services on individual nodes without restarting the node:
+
+```bash
+kubectl annotate node <node-name> \
+  worker.gardener.cloud/restart-systemd-services=kubelet,containerd
+```
+
+Gardener removes the annotation after all services have been restarted (regardless of whether individual restarts succeeded or failed).

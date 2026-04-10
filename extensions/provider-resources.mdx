@@ -1,0 +1,679 @@
+---
+title: "Gardener Extension Resource Types Reference"
+description: "Reference for Gardener extension resources: Infrastructure, Worker, ControlPlane, Network, DNSRecord, OperatingSystemConfig, Bastion, and BackupBucket."
+---
+
+Gardener defines a set of extension resource types in the `extensions.gardener.cloud/v1alpha1` API group. These resources represent the contracts between Gardener core and extension controllers. Gardener creates them with a desired state; extension controllers reconcile that state and report back through the `.status` field. Each resource has a `.spec.type` field that determines which extension controller is responsible.
+
+<Note>
+All extension resources are created by Gardener itself, either in the garden runtime cluster or in seed clusters. Extension controllers never create these resources — they only watch and reconcile them.
+</Note>
+
+<AccordionGroup>
+
+  <Accordion title="Infrastructure">
+
+## Infrastructure
+
+The `Infrastructure` resource represents the low-level cloud infrastructure required for a shoot cluster: VPCs, subnets, route tables, security groups, IAM roles, SSH key pairs, and similar provider-specific resources. Before the extension model was introduced, Gardener used Terraform to manage these resources in-tree.
+
+Gardener creates one `Infrastructure` resource per shoot namespace in the seed. Your controller must watch all `Infrastructure` resources with `.spec.type=<your-provider-name>`.
+
+**Example spec (Azure):**
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Infrastructure
+metadata:
+  name: infrastructure
+  namespace: shoot--foo--bar
+spec:
+  type: azure
+  region: eu-west-1
+  secretRef:
+    name: cloudprovider
+    namespace: shoot--foo--bar
+  providerConfig:
+    apiVersion: azure.provider.extensions.gardener.cloud/v1alpha1
+    kind: InfrastructureConfig
+    resourceGroup:
+      name: mygroup
+    networks:
+      vnet:
+        cidr: 10.250.0.0/16
+      workers: 10.250.0.0/19
+```
+
+The `.spec.providerConfig` is opaque to Gardener — it is copied directly from the `Shoot` resource. You design the schema.
+
+**Status output:**
+
+After provisioning, write the results into `.status.providerStatus`. Subsequent resources (like `Worker`) receive this as input:
+
+```yaml
+status:
+  lastOperation: ...
+  providerStatus:
+    apiVersion: azure.provider.extensions.gardener.cloud/v1alpha1
+    kind: InfrastructureStatus
+    resourceGroup:
+      name: mygroup
+    networks:
+      vnet:
+        name: my-vnet
+      subnets:
+      - purpose: nodes
+        name: my-subnet
+    availabilitySets:
+    - purpose: nodes
+      id: av-set-id
+      name: av-set-name
+    routeTables:
+    - purpose: nodes
+      name: route-table-name
+    securityGroups:
+    - purpose: nodes
+      name: sec-group-name
+```
+
+**Dynamic node CIDR:**
+
+If the environment does not allow end-users to statically define a node CIDR, the extension controller can dynamically provision a network and report back the CIDR:
+
+```yaml
+status:
+  lastOperation: ...
+  providerStatus: ...
+  nodesCIDR: 10.250.0.0/16
+```
+
+Gardener will use this value to configure VPN connectivity between the control plane and worker nodes. If `.spec.networking.nodes` is also set in the `Shoot`, the `status.nodesCIDR` value takes priority.
+
+**Implementation interfaces:**
+
+**Actuator**: Implement `Reconcile`, `Delete`, `Migrate`, and `Restore` methods.
+
+**ConfigValidator**: Optionally implement a `Validate` method called at the start of each reconciliation to verify provider-side resources (e.g., VPCs exist). Returns errors with code `ERR_CONFIGURATION_PROBLEM`.
+
+</Accordion>
+
+  <Accordion title="Worker">
+
+## Worker
+
+The `Worker` resource triggers the creation and management of shoot worker nodes (virtual machines) using the [machine-controller-manager](https://github.com/gardener/machine-controller-manager). The machine-controller-manager extends the Kubernetes API with `MachineClass`, `MachineDeployment`, `MachineSet`, and `Machine` objects, enabling VM management in the Kubernetes style.
+
+`gardenlet` deploys the machine-controller-manager itself. Your provider extension only needs to inject a provider-specific sidecar container and create the appropriate `MachineClass` and `MachineDeployment` objects.
+
+**Example spec:**
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Worker
+metadata:
+  name: bar
+  namespace: shoot--foo--bar
+spec:
+  type: azure
+  region: eu-west-1
+  secretRef:
+    name: cloudprovider
+    namespace: shoot--foo--bar
+  infrastructureProviderStatus:
+    apiVersion: aws.provider.extensions.gardener.cloud/v1alpha1
+    kind: InfrastructureStatus
+    ec2:
+      keyName: shoot--foo--bar-ssh-publickey
+    vpc:
+      id: vpc-0123456789
+      securityGroups:
+      - id: sg-1234567890
+        purpose: nodes
+      subnets:
+      - id: subnet-01234
+        purpose: nodes
+        zone: eu-west-1b
+  pools:
+  - name: cpu-worker
+    minimum: 3
+    maximum: 5
+    maxSurge: 1
+    maxUnavailable: 0
+    machineType: m4.large
+    machineImage:
+      name: coreos
+      version: 1967.5.0
+    nodeAgentSecretName: gardener-node-agent-local-ee46034b8269353b
+    volume:
+      size: 20Gi
+      type: gp2
+    zones:
+    - eu-west-1b
+    - eu-west-1c
+```
+
+The `.spec.infrastructureProviderStatus` is the output from the `Infrastructure` resource, forwarded here by Gardener.
+
+**Machine class output convention:**
+
+Create one `MachineClass` and `MachineDeployment` per availability zone. Use a 5-letter hash suffix based on the machine class spec to trigger rolling updates when configuration changes:
+
+```yaml
+apiVersion: machine.sapcloud.io/v1alpha1
+kind: AWSMachineClass
+metadata:
+  name: shoot--foo--bar-cpu-worker-z1-3db65
+  namespace: shoot--foo--bar
+spec:
+  ami: ami-0123456789
+  blockDevices:
+  - ebs:
+      volumeSize: 20
+      volumeType: gp2
+  iam:
+    name: shoot--foo--bar-nodes
+  keyName: shoot--foo--bar-ssh-publickey
+  machineType: m4.large
+  networkInterfaces:
+  - securityGroupIDs:
+    - sg-1234567890
+    subnetID: subnet-01234
+  region: eu-west-1
+  secretRef:
+    name: shoot--foo--bar-cpu-worker-z1-3db65
+    namespace: shoot--foo--bar
+```
+
+**Status output for Cluster Autoscaler:**
+
+Report created `MachineDeployment` names and min/max replicas so Gardener can configure the cluster-autoscaler:
+
+```yaml
+status:
+  lastOperation: ...
+  machineDeployments:
+  - name: shoot--foo--bar-cpu-worker-z1
+    minimum: 2
+    maximum: 3
+  - name: shoot--foo--bar-cpu-worker-z2
+    minimum: 1
+    maximum: 2
+  machineDeploymentsLastUpdateTime: "2023-05-01T12:44:27Z"
+```
+
+Update `machineDeploymentsLastUpdateTime` together with `machineDeployments` so Gardener can deploy the cluster-autoscaler without waiting for full reconciliation.
+
+  </Accordion>
+
+  <Accordion title="ControlPlane">
+
+## ControlPlane
+
+The `ControlPlane` resource triggers the deployment of provider-specific control plane components — primarily the `cloud-controller-manager` and any CSI drivers — into the shoot namespace in the seed. Gardener intentionally does not deploy these components itself, since they are entirely provider-specific.
+
+**Example spec (OpenStack):**
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: ControlPlane
+metadata:
+  name: control-plane
+  namespace: shoot--foo--bar
+spec:
+  type: openstack
+  region: europe-west1
+  secretRef:
+    name: cloudprovider
+    namespace: shoot--foo--bar
+  providerConfig:
+    apiVersion: openstack.provider.extensions.gardener.cloud/v1alpha1
+    kind: ControlPlaneConfig
+    loadBalancerProvider: provider
+    zone: eu-1a
+    cloudControllerManager:
+      featureGates:
+        CustomResourceValidation: true
+  infrastructureProviderStatus:
+    apiVersion: openstack.provider.extensions.gardener.cloud/v1alpha1
+    kind: InfrastructureStatus
+    networks:
+      floatingPool:
+        id: vpc-1234
+      subnets:
+      - purpose: nodes
+        id: subnetid
+```
+
+The `.spec.providerConfig` contains the user-specified provider configuration, and `.spec.infrastructureProviderStatus` carries the output from infrastructure provisioning (useful for CCM configuration).
+
+**Network policies:**
+
+The shoot namespace contains network policies that deny all ingress and egress by default. Pods deployed by the `ControlPlane` controller must have labels matching the network policy selectors to communicate with other components (such as `kube-apiserver`). See the [Gardener network policies documentation](https://github.com/gardener/gardener/blob/master/docs/operations/network_policies.md) for details.
+
+  </Accordion>
+
+  <Accordion title="Network">
+
+## Network
+
+The `Network` resource triggers the installation and configuration of a CNI (Container Network Interface) plugin in the shoot cluster. Gardener previously only supported Calico; the extension model makes the networking layer fully pluggable.
+
+**Example spec (Calico):**
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Network
+metadata:
+  name: my-network
+spec:
+  ipFamilies:
+  - IPv4
+  podCIDR: 100.244.0.0/16
+  serviceCIDR: 100.32.0.0/13
+  type: calico
+  providerConfig:
+    apiVersion: calico.networking.extensions.gardener.cloud/v1alpha1
+    kind: NetworkConfig
+    backend: bird
+    ipam:
+      cidr: usePodCIDR
+      type: host-local
+status:
+  ipFamilies:
+  - IPv4
+```
+
+**Adding a new CNI plugin:**
+
+Implement a controller that watches `Network` resources with `.spec.type=<your-plugin>` and deploys the plugin into the shoot cluster. Define your own `providerConfig` schema:
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Network
+metadata:
+  name: my-network
+spec:
+  ipFamilies:
+  - IPv4
+  podCIDR: 100.244.0.0/16
+  serviceCIDR: 100.32.0.0/13
+  type: gardenet
+  providerConfig:
+    apiVersion: gardenet.networking.extensions.gardener.cloud/v1alpha1
+    kind: NetworkConfig
+    gardenetCustomConfigField: <value>
+    ipam:
+      cidr: usePodCIDR
+      type: host-local
+```
+
+**kube-proxy-less service routing:**
+
+If your networking plugin handles service routing without `kube-proxy` (i.e., the shoot sets `.spec.kubernetes.kubeproxy.enabled=false`), the networking extension is responsible for service routing. Check this flag during reconciliation and raise an error if your extension cannot handle it. You should also provide a validating admission webhook to reject unsupported configurations early.
+
+**IP family migration:**
+
+The `status.ipFamilies` field tracks the currently deployed IP family configuration. When migrating from single-stack to dual-stack, keep this field updated to reflect the actual deployed state.
+
+  </Accordion>
+
+  <Accordion title="DNSRecord">
+
+## DNSRecord
+
+The `DNSRecord` resource manages external DNS records required for shoot cluster access. Gardener creates `DNSRecord` resources for several purposes:
+
+- **Internal domain name**: A publicly resolvable DNS record pointing to the `kube-apiserver` load balancer. Used internally by Gardener and system components.
+- **External domain name**: A user-visible DNS record (optionally using a custom domain) pointing to the internal domain name.
+- **Seed ingress**: A wildcard DNS record for the seed's ingress controller.
+
+**Example resource:**
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dnsrecord-bar-external
+  namespace: shoot--foo--bar
+type: Opaque
+data:
+  # provider-specific credentials
+---
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: DNSRecord
+metadata:
+  name: dnsrecord-external
+  namespace: default
+spec:
+  type: aws-route53
+  secretRef:
+    name: dnsrecord-bar-external
+    namespace: shoot--foo--bar
+  name: api.bar.foo.my-fancy-domain.com
+  recordType: A
+  values:
+  - 1.2.3.4
+```
+
+Optional fields include `region`, `zone` (hosted zone ID), and `ttl` (defaults to 120 seconds).
+
+**Hosted zone caching:**
+
+If no zone is specified in the spec, determine it during the first reconciliation and cache it in the status to avoid repeated API calls to the DNS provider on subsequent reconciliations:
+
+```yaml
+status:
+  lastOperation: ...
+  zone: ZFOO
+```
+
+On subsequent reconciliations, use `status.zone`. If both `spec.zone` and `status.zone` are present, `spec.zone` takes priority.
+
+**Credential key naming:**
+
+Support both naming conventions for credential keys in secrets for compatibility with existing setups: the [external-dns-management](https://github.com/gardener/external-dns-management) convention (e.g., `AWS_ACCESS_KEY_ID`) and the provider extension convention (e.g., `accessKeyId`).
+
+</Accordion>
+
+  <Accordion title="OperatingSystemConfig">
+
+## OperatingSystemConfig
+
+The `OperatingSystemConfig` (OSC) resource defines the user-data and system configuration needed to bootstrap and maintain shoot worker nodes. Because provider APIs have user-data size limits (around 16KB), Gardener uses a two-stage approach: a small `gardener-node-init.sh` bootstrap script is provided to the machine, which then fetches and applies the full configuration using the `gardener-node-agent`.
+
+**Prerequisites for OS images:**
+
+All OS images must have pre-installed:
+- `containerd` (listening at `unix:///run/containerd/containerd.sock`, configured via `/etc/containerd/config.toml`)
+- `systemd`
+
+**OSC purposes:**
+
+An `OperatingSystemConfig` has one of two purposes:
+
+<Tabs>
+  <Tab title="provision">
+    Used by `gardenlet` when creating new VMs. Contains the `gardener-node-init.sh` script. The OS controller must translate `.spec.units` and `.spec.files` into OS-specific format (CoreOS cloud-config, Ignition, cloud-init, bash script, etc.) and store the result in a `Secret`:
+
+    ```yaml
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: osc-result-pool-01-original
+      namespace: default
+      ownerReferences:
+      - apiVersion: extensions.gardener.cloud/v1alpha1
+        blockOwnerDeletion: true
+        controller: true
+        kind: OperatingSystemConfig
+        name: pool-01-original
+        uid: 99c0c5ca-19b9-11e9-9ebd-d67077b40f82
+    data:
+      cloud_config: base64(generated-user-data)
+    ```
+
+    Then report the secret reference in status:
+
+    ```yaml
+    status:
+      cloudConfig:
+        secretRef:
+          name: osc-result-pool-01-original
+          namespace: default
+      lastOperation:
+        description: Successfully generated cloud config
+        lastUpdateTime: "2019-01-23T07:45:23Z"
+        progress: 100
+        state: Succeeded
+        type: Reconcile
+      observedGeneration: 5
+    ```
+  </Tab>
+  <Tab title="reconcile">
+    Contains the "original" configuration applied by `gardener-node-agent` on the running node. The OS controller does not need to translate anything here but can contribute additional systemd units and files via the status:
+
+    ```yaml
+    status:
+      extensionUnits:
+      - name: my-custom-service.service
+        command: start
+        enable: true
+        content: |
+          [Unit]
+          // some systemd unit content
+      extensionFiles:
+      - path: /etc/some/file
+        permissions: 0644
+        content:
+          inline:
+            data: some-file-content
+      lastOperation:
+        description: Successfully generated cloud config
+        lastUpdateTime: "2019-01-23T07:45:23Z"
+        progress: 100
+        state: Succeeded
+        type: Reconcile
+      observedGeneration: 5
+    ```
+  </Tab>
+</Tabs>
+
+**Example spec:**
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: OperatingSystemConfig
+metadata:
+  name: pool-01-original
+  namespace: default
+spec:
+  type: <my-operating-system>
+  purpose: reconcile
+  units:
+  - name: containerd.service
+    dropIns:
+    - name: 10-containerd-opts.conf
+      content: |
+        [Service]
+        Environment="SOME_OPTS=--foo=bar"
+  files:
+  - path: /var/lib/kubelet/ca.crt
+    permissions: 0644
+    encoding: b64
+    content:
+      secretRef:
+        name: default-token-5dtjz
+        dataKey: token
+  - path: /etc/sysctl.d/99-k8s-general.conf
+    permissions: 0644
+    content:
+      inline:
+        data: |
+          vm.max_map_count = 135217728
+```
+
+**In-place OS updates:**
+
+OSes that support in-place updates (upgrading without replacing the node) must define the update command in `.status.inPlaceUpdates`:
+
+```yaml
+status:
+  inPlaceUpdates:
+    osUpdate:
+      command: /update-me
+      args:
+        - foo
+        - bar
+```
+
+  </Accordion>
+
+  <Accordion title="Bastion">
+
+## Bastion
+
+The `Bastion` resource provisions a temporary jump host (bastion server) that allows SSH access to shoot worker nodes. Bastions are created on demand when users request SSH access via `gardenctl`. They have an expiry date after which they are garbage collected.
+
+**Example spec:**
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Bastion
+metadata:
+  name: mybastion
+  namespace: shoot--foo--bar
+spec:
+  type: aws
+  userData: IyEvYmluL2Jhc2ggL....Nlcgo=
+  ingress:
+    - ipBlock:
+        cidr: 192.88.99.0/32
+```
+
+Your controller must:
+1. Create a new VM instance at the cloud provider
+2. Configure firewall rules to allow SSH (TCP 22) only from the specified IP blocks
+3. Update worker node firewall rules to allow SSH from the bastion instance
+4. Reverse all changes when the `Bastion` resource is deleted
+
+When the bastion is ready, write its public IP to the `.status` field so `gardenctl` can present it to the user.
+
+<Note>
+When SSH access is disabled on the `Shoot` (via worker settings), all `Bastion` resources are deleted during reconciliation and new ones are rejected.
+</Note>
+
+  </Accordion>
+
+  <Accordion title="BackupBucket and BackupEntry">
+
+## BackupBucket and BackupEntry
+
+The `BackupBucket` resource manages the cloud storage bucket used for periodic etcd backups (via [etcd-backup-restore](https://github.com/gardener/etcd-backup-restore)). One bucket is provisioned per seed cluster; all shoots on that seed share the bucket but use shoot-specific prefixes.
+
+**Lifecycle:** The bucket is created when a seed is created and deleted when the seed is deleted (only if no `BackupEntry` resources reference it).
+
+**Example spec:**
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: BackupBucket
+metadata:
+  name: foo
+spec:
+  type: azure
+  providerConfig:
+    <some-optional-provider-specific-backupbucket-configuration>
+  region: eu-west-1
+  secretRef:
+    name: backupprovider
+    namespace: shoot--foo--bar
+```
+
+After creating the bucket, if access credentials differ from the provider secret, generate a secret and reference it in `status.generatedSecretRef`. The namespace for this secret is specified in the `backupbucket.extensions.gardener.cloud/generated-secret-namespace` annotation; default to `garden` if the annotation is absent.
+
+The `BackupEntry` resource represents a specific shoot's backup prefix within a `BackupBucket`. It is used by etcd-backup-restore to read and write etcd snapshots for a specific shoot.
+
+  </Accordion>
+
+  <Accordion title="Extension (generic)">
+
+## Extension (generic)
+
+The `Extension` resource is a generic hook for functionality that does not fit neatly into one of the specialized resource kinds. It allows extension controllers to perform arbitrary work at specific points in the shoot reconciliation or deletion flow.
+
+**Registration:**
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerRegistration
+metadata:
+  name: extension-example
+spec:
+  resources:
+  - kind: Extension
+    type: example
+    autoEnable:
+    - shoot
+    workerlessSupported: true
+```
+
+When `autoEnable` includes `shoot`, Gardener creates one `Extension` resource per shoot. With `workerlessSupported: true`, the extension is also created for workerless shoots.
+
+**Resource in the seed:**
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Extension
+metadata:
+  name: example
+  namespace: shoot--foo--bar
+spec:
+  type: example
+  providerConfig: {}
+```
+
+**Passing configuration from the Shoot:**
+
+Users can pass data through the `Shoot` spec that is forwarded to the `Extension` resource's `providerConfig`:
+
+```yaml
+# In the Shoot resource:
+spec:
+  extensions:
+  - type: example
+    providerConfig:
+      foo: bar
+```
+
+Results in:
+
+```yaml
+# In the Extension resource in the seed:
+spec:
+  type: example
+  providerConfig:
+    foo: bar
+```
+
+**Status reporting:**
+
+Always maintain the status correctly. Gardener only reports a successful reconciliation when `status.lastOperation.state` is `Succeeded`:
+
+```yaml
+status:
+  lastOperation:
+    state: Succeeded
+  observedGeneration: 1
+```
+
+  </Accordion>
+
+</AccordionGroup>
+
+## The Cluster resource
+
+All extension controllers have access to a `Cluster` resource in the shoot namespace that contains the full `CloudProfile`, `Seed`, and `Shoot` manifests. Use this to access information that is not part of your specific extension resource:
+
+```yaml
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Cluster
+metadata:
+  name: shoot--foo--bar
+spec:
+  cloudProfile:
+    apiVersion: core.gardener.cloud/v1beta1
+    kind: CloudProfile
+    ...
+  seed:
+    apiVersion: core.gardener.cloud/v1beta1
+    kind: Seed
+    ...
+  shoot:
+    apiVersion: core.gardener.cloud/v1beta1
+    kind: Shoot
+    ...
+```
+
+Important fields to check from the `Cluster` resource:
+- `.spec.shoot.spec.hibernation.enabled`: Whether to scale down control plane components.
+- `.spec.shoot.status.lastOperation.state=Failed`: Gardener has given up auto-retrying. Your extension should also stop auto-retrying and wait for a manual re-trigger.

@@ -1,0 +1,260 @@
+---
+title: "Deploying Gardener Remotely on a Real Cloud Provider"
+description: "Deploy a full Gardener landscape remotely using Skaffold and gardener-operator on AWS, Azure, GCP, or any Kubernetes cluster in under an hour."
+---
+
+This guide walks you through deploying Gardener on a remote Kubernetes cluster backed by a real cloud provider. It is intended for running your local Gardener development on actual infrastructure, where you can create real shoot clusters with cloud-backed worker nodes.
+
+This guide has been tested with Kubernetes clusters on Gardener, AWS, Azure, and GCP. It uses `gardener-operator` to manage Gardener components, with [Skaffold](https://skaffold.dev/) building and pushing container images.
+
+<Note>
+For a simpler local-only setup without cloud credentials, see [getting started locally](/deployment/getting-started-locally).
+</Note>
+
+## Prerequisites
+
+You need access to a Kubernetes cluster to use as the garden runtime and soil cluster. When choosing a cluster:
+
+- Use machines with a **1:4 CPU-to-memory ratio** for best resource utilization. For example, 4 vCPUs and 16 GB memory per node is a good starting point.
+- Your cluster must use a **single CPU architecture** since Skaffold does not build multi-arch images. The cluster's architecture can differ from your local machine's.
+- Using a **Gardener shoot cluster** as the remote cluster simplifies setup — some configuration is inferred from `shoot-info` and DNS/TLS are automated.
+
+<Info>
+When bootstrapping `gardenlet` to the cluster, your soil cluster inherits the provider type of the shoot you use. An AWS shoot becomes an AWS soil; a GCP shoot becomes a GCP soil.
+</Info>
+
+## Provide credentials and configuration
+
+The remote setup requires credentials for DNS, cloud infrastructure, and access to your Kubernetes cluster.
+
+<Warning>
+The repository contains `.gitignore` entries for all credential files and directories. Double-check that no credentials are committed to version control before proceeding.
+</Warning>
+
+### DNS
+
+Gardener's control plane requires DNS for the virtual garden, default domain, and internal domain. Configure a valid DNS provider for your setup:
+
+- **Virtual garden DNS** — maintain credentials at `/dev-setup/garden/overlays/remote/secret-dns.yaml`
+- **Default and internal domains** — choose one of:
+  - Workload identity: maintain `WorkloadIdentity` resources at `/dev-setup/gardenconfig/overlays/remote/credentials/domains/domain-workload-identities.yaml`
+  - Static credentials: maintain `Secret` resources at `/dev-setup/gardenconfig/overlays/remote/credentials/domains/domain-secrets.yaml`
+
+Template files with `.tmpl` suffixes exist in each directory as a starting point.
+
+### Infrastructure credentials
+
+Infrastructure credentials are needed for the `remote` and `garden` projects. If you do not plan to create additional seeds, the `garden` project secrets can remain empty.
+
+<Tabs>
+  <Tab title="Workload identity">
+    Update the `WorkloadIdentity` resources in:
+    - `garden` project: `/dev-setup/gardenconfig/overlays/remote/credentials/credentials-project-garden/infrastructure-workloadidentities.yaml`
+    - `remote` project: `/dev-setup/gardenconfig/overlays/remote/credentials/credentials-project-remote/infrastructure-workloadidentities.yaml`
+
+    Then maintain `CredentialsBinding` resources at:
+    - `garden` project: `/dev-setup/gardenconfig/overlays/remote/credentials/credentials-project-garden/credentialsbindings.yaml`
+    - `remote` project: `/dev-setup/gardenconfig/overlays/remote/credentials/credentials-project-remote/credentialsbindings.yaml`
+  </Tab>
+  <Tab title="Static credentials">
+    Update the `Secret` resources in:
+    - `garden` project: `/dev-setup/gardenconfig/overlays/remote/credentials/credentials-project-garden/infrastructure-secrets.yaml`
+    - `remote` project: `/dev-setup/gardenconfig/overlays/remote/credentials/credentials-project-remote/infrastructure-secrets.yaml`
+
+    Then maintain `CredentialsBinding` resources at:
+    - `garden` project: `/dev-setup/gardenconfig/overlays/remote/credentials/credentials-project-garden/credentialsbindings.yaml`
+    - `remote` project: `/dev-setup/gardenconfig/overlays/remote/credentials/credentials-project-remote/credentialsbindings.yaml`
+  </Tab>
+</Tabs>
+
+### Garden runtime and soil cluster kubeconfig
+
+Place your cluster kubeconfig at `/dev-setup/remote/kubeconfigs/kubeconfig`.
+
+<Warning>
+Do not use a kubeconfig created with `gardenctl`. It causes errors when Skaffold runs `kubectl` commands.
+</Warning>
+
+### Garden and gardenlet configuration
+
+Configure your Garden at `/dev-setup/garden/overlays/remote/garden.yaml` and your gardenlet at `/dev-setup/gardenlet/overlays/remote/gardenlet.yaml`. These files are generated from the corresponding `.yaml.tmpl` templates on first run and include inline explanations of each property.
+
+### Extensions
+
+Place any `Extension` resources (networking, OS, provider extensions) in `/dev-setup/extensions/remote/`. The entire directory is applied to your garden runtime cluster. At minimum you will need one networking, one provider, and one OS extension.
+
+### CloudProfiles
+
+No demo `CloudProfiles` are included. Copy `CloudProfile` resources from an existing landscape or create your own based on [the gardener examples](https://github.com/gardener/gardener/blob/master/example/30-cloudprofile.yaml). Most provider extension repositories include example `CloudProfile` manifests.
+
+## Deploying Gardener remotely
+
+<Steps>
+  <Step title="Prepare the remote cluster">
+    ```bash
+    make remote-up
+    ```
+
+    This command:
+    - Generates config files from `.yaml.tmpl` templates if they do not exist
+    - Validates required configuration options and returns errors for any that are missing
+    - Deploys a container registry into your remote cluster
+    - Copies the runtime kubeconfig to `/dev-setup/kubeconfigs/runtime/kubeconfig`
+    - Sets the `remote` scenario for all subsequent `make` commands
+
+    To enable workload identity support:
+
+    ```bash
+    DEV_SETUP_WITH_WORKLOAD_IDENTITY_SUPPORT=true make remote-up
+    ```
+
+    Gardener Operator automatically deploys the Gardener Discovery Server when workload identity is enabled. For provider-specific workload identity federation setup, refer to the documentation for [provider-aws](https://github.com/gardener/gardener-extension-provider-aws/blob/master/docs/usage/usage.md#aws-workload-identity-federation), [provider-azure](https://github.com/gardener/gardener-extension-provider-azure/blob/master/docs/usage/usage.md#azure-workload-identity-federation), or [provider-gcp](https://github.com/gardener/gardener-extension-provider-gcp/blob/master/docs/usage/usage.md#gcp-workload-identity-federation).
+
+    <Note>
+    Whenever you want to target your remote cluster after running a different local scenario, run `make remote-up` again to restore the correct context.
+    </Note>
+  </Step>
+
+  <Step title="Deploy gardener-operator">
+    ```bash
+    make operator-up
+    ```
+
+    This builds container images for all Gardener components, pushes them to the registry in your remote cluster, and deploys `gardener-operator`. It also applies the `Extension` resources you defined in `/dev-setup/extensions/remote/`.
+  </Step>
+
+  <Step title="Create the Garden">
+    ```bash
+    make garden-up
+    ```
+
+    This creates the `Garden` resource from your configuration. When complete, the virtual garden kubeconfig is copied to `/dev-setup/kubeconfigs/virtual-garden/kubeconfig`.
+  </Step>
+
+  <Step title="Bootstrap the gardenlet (soil)">
+    ```bash
+    make seed-up
+    ```
+
+    This deploys the `Gardenlet` resource into your virtual garden, which bootstraps your remote cluster as a soil cluster. Once complete, you have a combined garden runtime and soil cluster, and can start creating shoot clusters.
+
+    Wait for the seed to become ready (this check is included in `make seed-up` but is also useful after waking a hibernated cluster):
+
+    ```bash
+    kubectl wait --for=condition=gardenletready seed remote --timeout=5m
+    ```
+
+    Or poll manually:
+
+    ```bash
+    kubectl get seed remote
+    ```
+
+    Expected output when ready:
+
+    ```bash
+    NAME     STATUS   PROVIDER   REGION         AGE    VERSION        K8S VERSION
+    remote   Ready    gcp        europe-west1   111m   v1.137.0-dev   v1.34.7
+    ```
+  </Step>
+
+  <Step title="Create a Shoot cluster">
+    Create a `Shoot` manifest for your desired provider and apply it to your virtual garden cluster:
+
+    ```bash
+    kubectl apply -f <your-shoot.yaml>
+    ```
+
+    The scheduler is configured with `candidateDeterminationStrategy: MinimalDistance`, so you can schedule shoots from different providers on the same seed.
+
+    Monitor shoot creation progress:
+
+    ```bash
+    kubectl -n garden-local get shoots
+    ```
+
+    Example output showing multiple shoots being provisioned:
+
+    ```bash
+    NAME        CLOUDPROFILE   PROVIDER   REGION         K8S VERSION   HIBERNATION   LAST OPERATION               STATUS    AGE
+    aws         aws            aws        eu-west-1      1.34.3        Awake         Create Processing (43%)      healthy   84s
+    aws-arm64   aws            aws        eu-west-1      1.34.3        Awake         Create Processing (43%)      healthy   65s
+    azure       az             azure      westeurope     1.34.2        Awake         Create Processing (43%)      healthy   57s
+    gcp         gcp            gcp        europe-west1   1.34.3        Awake         Create Processing (43%)      healthy   94s
+    ```
+
+    Wait for `LAST OPERATION` to reach `100%`.
+  </Step>
+
+  <Step title="Access your Shoot cluster">
+    Shoot clusters have public DNS entries for their API servers, reachable directly via `kubectl` from the internet.
+
+    Use the `adminkubeconfig` subresource to generate a kubeconfig:
+
+    ```bash
+    kubectl create -f - <<EOF
+    apiVersion: authentication.gardener.cloud/v1alpha1
+    kind: AdminKubeconfigRequest
+    metadata:
+      name: my-shoot
+      namespace: garden-remote
+    spec:
+      expirationSeconds: 3600
+    EOF
+    ```
+
+    See [Accessing Shoot Clusters](https://github.com/gardener/gardener/blob/master/docs/usage/shoot/shoot_access.md#shootsadminkubeconfig-subresource) for the full usage reference.
+  </Step>
+</Steps>
+
+## Rotating container registry credentials
+
+The garden runtime cluster hosts a password-protected container registry. The password is generated by `make remote-up` and is not rotated automatically to avoid breaking `gardener-node-agent` image pulls during updates.
+
+To rotate credentials manually:
+
+```bash
+# Ensure images are up to date
+make operator-up garden-up seed-up
+# Reconcile all shoots on the seed
+# Delete the registry password secret
+kubectl delete secrets -n registry registry-password
+# Regenerate
+make remote-up
+# Reconcile shoots again
+```
+
+Alternatively, use the registry deploy script directly:
+
+```bash
+./dev-setup/remote/registry/deploy-registry.sh \
+  <path-to-runtime-kubeconfig> \
+  <registry-hostname> \
+  <path-to-virtual-garden-kubeconfig>
+```
+
+## Tearing down
+
+<Warning>
+Always delete shoot clusters before tearing down the environment to avoid leaving orphaned resources on your infrastructure accounts.
+</Warning>
+
+Delete each shoot cluster:
+
+```bash
+./hack/usage/delete shoot <your-shoot> garden-local
+```
+
+Then shut down the full environment in order:
+
+```bash
+make seed-down garden-down operator-down remote-down
+```
+
+This sequence:
+1. Uninstalls gardenlet from the soil
+2. Destroys the Garden
+3. Removes gardener-operator
+4. Deletes the container registry and other additional components from the remote cluster
+
+Ensure your remote cluster is online (not paused or hibernated) before running the teardown sequence.

@@ -1,0 +1,121 @@
+---
+title: "operations.gardener.cloud API Group Reference"
+description: "Reference for operations.gardener.cloud/v1alpha1: Bastion resource for SSH access to shoot worker nodes via an ephemeral cloud bastion host."
+---
+
+The `operations.gardener.cloud/v1alpha1` API group provides resources for operational tasks on Shoot clusters. Currently it contains a single resource type: `Bastion`, which represents an SSH bastion host that provides temporary, audited access to worker nodes in a Shoot cluster.
+
+```bash
+# List all resource types in the operations API group
+kubectl api-resources --api-group=operations.gardener.cloud
+```
+
+## Bastion
+
+A `Bastion` is an ephemeral SSH bastion host provisioned by Gardener in the same cloud provider account and region as the target Shoot cluster. You create a `Bastion` resource to gain SSH access to worker nodes, then delete it when done. The bastion host is automatically cleaned up when the `Bastion` resource is deleted.
+
+When you create a `Bastion`, Gardener:
+1. Creates the bastion VM in the cloud (via the provider extension in the seed cluster).
+2. Configures the bastion with your public SSH key.
+3. Restricts ingress to the IP addresses or CIDRs you specify.
+4. Populates `status.ingress` with the public IP or hostname of the bastion.
+
+<Note>
+  Bastions have a configurable TTL and are automatically garbage-collected after expiry. The default TTL is typically 24 hours. You can delete the `Bastion` resource at any time to immediately terminate the bastion host.
+</Note>
+
+### Key spec fields
+
+<ParamField path="spec.shootRef.name" type="string" required>
+  Name of the Shoot cluster in the same namespace for which the bastion is being created.
+</ParamField>
+
+<ParamField path="spec.sshPublicKey" type="string" required>
+  The SSH public key that will be authorized on the bastion host. Must be a valid OpenSSH public key (e.g., starting with `ssh-rsa` or `ssh-ed25519`).
+</ParamField>
+
+<ParamField path="spec.ingress" type="array" required>
+  List of ingress policies restricting which IP addresses can connect to the bastion's SSH port (22). Each entry contains an `ipBlock.cidr` field.
+</ParamField>
+
+### Status fields
+
+<ResponseField name="status.ingress.ip" type="string">
+  Public IP address of the provisioned bastion host. Use this to connect via SSH.
+</ResponseField>
+
+<ResponseField name="status.ingress.hostname" type="string">
+  Public hostname of the provisioned bastion host (if applicable). May be used instead of IP.
+</ResponseField>
+
+<ResponseField name="status.conditions" type="array">
+  Conditions reflecting the current state of the bastion. Key conditions include `BastionReady` (the bastion VM is provisioned and SSH is accessible) and `ExpirationTimeValid`.
+</ResponseField>
+
+<ResponseField name="status.expirationTimestamp" type="string">
+  Time at which this bastion will be automatically garbage-collected.
+</ResponseField>
+
+### Creating a bastion
+
+```yaml
+apiVersion: operations.gardener.cloud/v1alpha1
+kind: Bastion
+metadata:
+  name: example-bastion
+  namespace: garden-dev
+spec:
+  shootRef:
+    name: example-shoot
+  sshPublicKey: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDcSZKq0lM9w+ElLp9I9jFvqEFbOV1+iOBX7WEe66GvPLOWl9ul03ecjhOf06+FhPsWFac1yaxo2xj+SJ+FVZ3DdSn4fjTpS9NGyQVPInSZveetRw0TV0rbYCFBTJuVqUFu6yPEgdcWq8dlUjLqnRNwlelHRcJeBfACBZDLNSxjj0oUz7ANRNCEne1ecySwuJUAz3IlNLPXFexRT0alV7Nl9hmJke3dD73nbeGbQtwvtu8GNFEoO4Eu3xOCKsLw6ILLo4FBiFcYQOZqvYZgCb4ncKM52bnABagG54upgBMZBRzOJvWp0ol+jK3Em7Vb6ufDTTVNiQY78U6BAlNZ8Xg+LUVeyk1C6vWjzAQf02eRvMdfnRCFvmwUpzbHWaVMsQm8gf3AgnTUuDR0ev1nQH/5892wZA86uLYW/wLiiSbvQsqtY1jSn9BAGFGdhXgWLAkGsd/E1vOT+vDcor6/6KjHBm0rG697A3TDBRkbXQ/1oFxcM9m17RteCaXuTiAYWMqGKDoJvTMDc4L+Uvy544pEfbOH39zfkIYE76WLAFPFsUWX6lXFjQrX3O7vEV73bCHoJnwzaNd03PSdJOw+LCzrTmxVezwli3F9wUDiBRB0HkQxIXQmncc1HSecCKALkogIK+1e1OumoWh6gPdkF4PlTMUxRitrwPWSaiUIlPfCpQ== you@example.com
+  ingress:
+    - ipBlock:
+        cidr: 1.2.3.4/32
+```
+
+### Connecting to worker nodes
+
+Once the bastion is ready, check the status for the bastion's IP address:
+
+```bash
+# Watch bastion status until ready
+kubectl get bastion example-bastion -n garden-dev -w
+
+# Get the bastion IP
+kubectl get bastion example-bastion -n garden-dev \
+  -o jsonpath='{.status.ingress.ip}'
+```
+
+Connect to the bastion first, then hop to a worker node:
+
+```bash
+# SSH to the bastion
+ssh -i ~/.ssh/id_rsa gardener@<bastion-ip>
+
+# From the bastion, SSH to a worker node's private IP
+ssh -i ~/.ssh/id_rsa gardener@<worker-node-private-ip>
+```
+
+<Tip>
+  The `gardenctl` CLI tool provides a convenient `gardenctl ssh` command that automates the bastion lifecycle: it creates the `Bastion` resource, waits for it to become ready, opens the SSH tunnel, and deletes the bastion when you disconnect.
+</Tip>
+
+### Cleanup
+
+Delete the `Bastion` resource to immediately terminate the bastion host:
+
+```bash
+kubectl delete bastion example-bastion -n garden-dev
+```
+
+<Warning>
+  Always delete bastions when you no longer need them. Leaving bastions running unnecessarily incurs cloud costs and increases the attack surface of your infrastructure.
+</Warning>
+
+### BastionIngressPolicy
+
+Each entry in `spec.ingress` is a `BastionIngressPolicy`:
+
+<ParamField path="ipBlock.cidr" type="string" required>
+  An IP block in CIDR notation (e.g., `203.0.113.0/32`) that is allowed to connect to the bastion on port 22. Use `/32` for a single IPv4 address or `/128` for a single IPv6 address.
+</ParamField>

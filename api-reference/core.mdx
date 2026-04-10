@@ -1,0 +1,647 @@
+---
+title: "core.gardener.cloud/v1beta1 API Group Reference"
+description: "Reference for core.gardener.cloud/v1beta1: Shoot, Seed, CloudProfile, Project, SecretBinding, CredentialsBinding, BackupBucket, and BackupEntry resources."
+---
+
+The `core.gardener.cloud/v1beta1` API group is the primary API group in Gardener. It contains the main resources you interact with to create and manage Kubernetes clusters (Shoots), register infrastructure (Seeds), define available machine types and OS images (CloudProfiles), organize teams (Projects), and configure backup and credentials.
+
+```bash
+# List all resource types in the core API group
+kubectl api-resources --api-group=core.gardener.cloud
+```
+
+## Resource types
+
+<AccordionGroup>
+
+  <Accordion title="Shoot">
+
+The `Shoot` resource describes a Kubernetes cluster that Gardener provisions and manages. A Shoot references a CloudProfile (to know what machine types and OS images are available), a Seed (to know where to deploy the control plane), and credentials (via a CredentialsBinding or SecretBinding) to access the cloud provider.
+
+### Key spec fields
+
+<ParamField path="spec.credentialsBindingName" type="string" required>
+  Name of the CredentialsBinding in the same namespace that provides cloud provider credentials for this Shoot.
+</ParamField>
+
+<ParamField path="spec.cloudProfile.name" type="string" required>
+  Name of the CloudProfile that defines available Kubernetes versions, machine types, and OS images for this Shoot.
+</ParamField>
+
+<ParamField path="spec.region" type="string" required>
+  The cloud provider region where the Shoot cluster is created (e.g., `europe-central-1`).
+</ParamField>
+
+<ParamField path="spec.purpose" type="string">
+  Declares the intended use of the cluster. One of `testing`, `development`, `production`, or `infrastructure`. Affects certain defaults and restrictions.
+</ParamField>
+
+<ParamField path="spec.provider.type" type="string" required>
+  The cloud provider type (e.g., `aws`, `azure`, `gcp`). Must match the type in the referenced CloudProfile.
+</ParamField>
+
+<ParamField path="spec.provider.infrastructureConfig" type="object">
+  Provider-specific infrastructure configuration (VPC settings, subnets, etc.). The schema is defined by the provider extension.
+</ParamField>
+
+<ParamField path="spec.provider.controlPlaneConfig" type="object">
+  Provider-specific control plane configuration. The schema is defined by the provider extension.
+</ParamField>
+
+<ParamField path="spec.provider.workers" type="array" required>
+  List of worker pools. Each pool defines machine type, OS image, minimum/maximum node counts, volume size, availability zones, and optional kubelet configuration.
+</ParamField>
+
+<ParamField path="spec.kubernetes.version" type="string">
+  The Kubernetes version to use for the shoot cluster. Must be a version available in the referenced CloudProfile.
+</ParamField>
+
+<ParamField path="spec.networking.type" type="string">
+  The network plugin type (e.g., `calico`, `cilium`). A corresponding network extension must be installed.
+</ParamField>
+
+<ParamField path="spec.networking.pods" type="string">
+  CIDR range for pod IP addresses (e.g., `100.96.0.0/11`).
+</ParamField>
+
+<ParamField path="spec.networking.nodes" type="string">
+  CIDR range for node IP addresses (e.g., `10.250.0.0/16`).
+</ParamField>
+
+<ParamField path="spec.networking.services" type="string">
+  CIDR range for service cluster IP addresses (e.g., `100.64.0.0/13`).
+</ParamField>
+
+<ParamField path="spec.maintenance.timeWindow.begin" type="string">
+  Start of the maintenance window in `HHmmss+ZONE` format (e.g., `220000+0100`).
+</ParamField>
+
+<ParamField path="spec.maintenance.autoUpdate.kubernetesVersion" type="boolean">
+  If `true`, Gardener automatically updates the Kubernetes patch version during the maintenance window.
+</ParamField>
+
+<ParamField path="spec.maintenance.autoUpdate.machineImageVersion" type="boolean">
+  If `true`, Gardener automatically updates worker pool OS image versions during the maintenance window.
+</ParamField>
+
+<ParamField path="spec.hibernation.enabled" type="boolean">
+  If `true`, the cluster is hibernated (control plane and workers are scaled to zero).
+</ParamField>
+
+<ParamField path="spec.hibernation.schedules" type="array">
+  Cron-based schedule for automatic hibernation and wake-up.
+</ParamField>
+
+<ParamField path="spec.extensions" type="array">
+  List of extensions to enable for this Shoot (e.g., custom DNS, certificate management).
+</ParamField>
+
+<ParamField path="spec.dns.domain" type="string">
+  The custom domain for the shoot cluster's API server and ingress. If omitted, Gardener auto-generates a domain.
+</ParamField>
+
+### Status conditions
+
+Gardener sets the following conditions on a Shoot's status:
+
+| Condition | Meaning |
+|---|---|
+| `APIServerAvailable` | The shoot's kube-apiserver is reachable from the seed |
+| `ControlPlaneHealthy` | All control plane components are healthy |
+| `EveryNodeReady` | All nodes in all worker pools are ready |
+| `ObservabilityComponentsHealthy` | Monitoring and logging components are healthy |
+| `SystemComponentsHealthy` | All system components (CoreDNS, kube-proxy, etc.) are healthy |
+| `HibernationPossible` | The cluster can be hibernated |
+| `MaintenancePreconditionsSatisfied` | Maintenance can proceed |
+
+### Example
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Shoot
+metadata:
+  name: crazy-botany
+  namespace: garden-dev
+spec:
+  credentialsBindingName: my-provider-account
+  cloudProfile:
+    name: cloudprofile1
+  region: europe-central-1
+  purpose: evaluation
+  provider:
+    type: aws
+    infrastructureConfig:
+      # provider-specific config
+    controlPlaneConfig:
+      # provider-specific config
+    workers:
+    - name: cpu-worker
+      minimum: 3
+      maximum: 5
+      machine:
+        type: m5.large
+        image:
+          name: gardenlinux
+          version: 15.4.20220818
+      volume:
+        type: gp2
+        size: 20Gi
+  kubernetes:
+    version: "1.32.4"
+  networking:
+    type: calico
+    ipFamilies:
+    - IPv4
+    pods: 100.96.0.0/11
+    nodes: 10.250.0.0/16
+    services: 100.64.0.0/13
+  maintenance:
+    timeWindow:
+      begin: 220000+0100
+      end: 230000+0100
+    autoUpdate:
+      kubernetesVersion: true
+      machineImageVersion: true
+  dns:
+    domain: crazy-botany.core.my-custom-domain.com
+  hibernation:
+    enabled: false
+    schedules:
+    - start: "0 20 * * *"
+      end: "0 6 * * *"
+      location: America/Los_Angeles
+```
+
+  </Accordion>
+
+  <Accordion title="Seed">
+
+A `Seed` resource registers an existing Kubernetes cluster as a seed cluster — the cluster where Gardener deploys shoot control planes. The gardenlet running in the seed cluster watches for Shoot resources and manages the lifecycle of the control plane components.
+
+### Key spec fields
+
+<ParamField path="spec.provider.type" type="string" required>
+  The cloud provider type of the seed cluster's underlying infrastructure (e.g., `aws`, `azure`, `gcp`).
+</ParamField>
+
+<ParamField path="spec.provider.region" type="string" required>
+  The cloud region where the seed cluster is hosted.
+</ParamField>
+
+<ParamField path="spec.provider.zones" type="array">
+  The availability zones available in the seed cluster's region.
+</ParamField>
+
+<ParamField path="spec.networks.nodes" type="string" required>
+  CIDR of the seed cluster's node network. Must not overlap with shoot networks.
+</ParamField>
+
+<ParamField path="spec.networks.pods" type="string" required>
+  CIDR of the seed cluster's pod network.
+</ParamField>
+
+<ParamField path="spec.networks.services" type="string" required>
+  CIDR of the seed cluster's service network.
+</ParamField>
+
+<ParamField path="spec.networks.ipFamilies" type="array">
+  IP families supported by the seed (e.g., `[IPv4]` or `[IPv4, IPv6]`).
+</ParamField>
+
+<ParamField path="spec.ingress.domain" type="string" required>
+  The domain used for the seed's ingress controller. Shoot observability components are exposed under this domain.
+</ParamField>
+
+<ParamField path="spec.backup" type="object">
+  Configuration of the backup object store provider for etcd backups of shoots scheduled on this seed.
+</ParamField>
+
+<ParamField path="spec.dns" type="object">
+  DNS provider configuration for the seed's internal and external domains.
+</ParamField>
+
+<ParamField path="spec.settings.dependencyWatchdog.weeder.enabled" type="boolean">
+  If `true`, crashlooping pods are restarted once their dependants become ready.
+</ParamField>
+
+<ParamField path="spec.settings.dependencyWatchdog.prober.enabled" type="boolean">
+  If `true`, shoot kube-controller-managers are scaled down when the kube-apiserver is unreachable via external DNS.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Seed
+metadata:
+  name: my-seed
+spec:
+  provider:
+    type: aws
+    region: europe-1
+    zones:
+    - europe-1a
+  backup:
+    provider: aws
+    region: europe-1
+    credentialsRef:
+      apiVersion: v1
+      kind: Secret
+      name: backup-secret
+      namespace: garden
+  dns:
+    provider:
+      type: aws-route53
+      credentialsRef:
+        apiVersion: v1
+        kind: Secret
+        name: ingress-secret
+        namespace: garden
+  ingress:
+    domain: ingress.dev.my-seed.example.com
+    controller:
+      kind: nginx
+  networks:
+    ipFamilies:
+    - IPv4
+    nodes: 10.240.0.0/16
+    pods: 10.241.128.0/17
+    services: 10.241.0.0/17
+    blockCIDRs:
+    - 169.254.169.254/32
+  settings:
+    dependencyWatchdog:
+      weeder:
+        enabled: true
+      prober:
+        enabled: true
+```
+
+  </Accordion>
+
+  <Accordion title="CloudProfile">
+
+A `CloudProfile` defines the catalog of machine types, OS images, Kubernetes versions, and regions available for Shoots that reference it. Cloud provider administrators create CloudProfiles; project members pick from their contents when creating Shoots.
+
+### Key spec fields
+
+<ParamField path="spec.type" type="string" required>
+  The cloud provider type this profile applies to (e.g., `aws`, `azure`, `gcp`).
+</ParamField>
+
+<ParamField path="spec.kubernetes.versions" type="array" required>
+  List of supported Kubernetes versions. Each entry has a `version` string and an optional `expirationDate`.
+</ParamField>
+
+<ParamField path="spec.machineImages" type="array" required>
+  List of supported OS images. Each image has a name and a list of versions with optional expiration dates and architecture constraints.
+</ParamField>
+
+<ParamField path="spec.machineTypes" type="array" required>
+  List of machine types available for worker pools. Each entry specifies `name`, `cpu`, `memory`, `gpu`, and optional storage.
+</ParamField>
+
+<ParamField path="spec.regions" type="array">
+  List of supported cloud regions with optional availability zones and access restrictions.
+</ParamField>
+
+<ParamField path="spec.providerConfig" type="object">
+  Provider-specific configuration for the CloudProfile. The schema is defined by the provider extension.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: CloudProfile
+metadata:
+  name: cloudprofile1
+spec:
+  type: aws
+  kubernetes:
+    versions:
+      - version: 1.33.2
+      - version: 1.32.4
+      - version: 1.31.6
+        expirationDate: "2025-11-30T01:02:03Z"
+  machineImages:
+    - name: gardenlinux
+      versions:
+        - version: 15.4.20220818
+        - version: 15.4.20220620
+          expirationDate: "2023-02-28T23:59:59Z"
+    - name: ubuntu
+      versions:
+        - version: 18.04.201906170
+  machineTypes:
+    - name: m5.large
+      cpu: "2"
+      gpu: "0"
+      memory: 8Gi
+```
+
+  </Accordion>
+
+  <Accordion title="Project">
+
+A `Project` logically groups team members, secrets, and Shoot clusters. Creating a Project causes Gardener to create a corresponding Kubernetes namespace prefixed with `garden-` in the garden cluster. All Shoot and credential resources belong to a Project namespace.
+
+### Key spec fields
+
+<ParamField path="spec.owner" type="object" required>
+  The owner of the project (a Kubernetes subject: User, Group, or ServiceAccount).
+</ParamField>
+
+<ParamField path="spec.members" type="array">
+  List of project members. Each member is a Kubernetes subject with an assigned `role` and optional additional `roles`.
+</ParamField>
+
+<ParamField path="spec.namespace" type="string">
+  The name of the resulting namespace. If omitted, Gardener generates one as `garden-<project-name>-<random>`.
+</ParamField>
+
+<ParamField path="spec.description" type="string">
+  Human-readable description of the project.
+</ParamField>
+
+<ParamField path="spec.purpose" type="string">
+  The stated purpose of the project.
+</ParamField>
+
+### Member roles
+
+| Role | Permissions |
+|---|---|
+| `owner` | Full access including deletion |
+| `admin` | Full access except deletion of the project |
+| `viewer` | Read-only access to project resources |
+| `uam` | User access manager — can manage project members |
+
+### Example
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Project
+metadata:
+  name: dev
+spec:
+  namespace: garden-dev
+  owner:
+    apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: john.doe@example.com
+  members:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: alice.doe@example.com
+    role: admin
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: bob.doe@example.com
+    role: viewer
+  description: "Development project"
+  purpose: "Experimenting with Gardener"
+```
+
+  </Accordion>
+
+  <Accordion title="SecretBinding and CredentialsBinding">
+
+`SecretBinding` (deprecated, being replaced by `CredentialsBinding` in `security.gardener.cloud/v1alpha1`) binds a Kubernetes Secret containing cloud provider credentials to a Shoot. The newer `CredentialsBinding` in the `core.gardener.cloud` group acts as a shim for backward compatibility.
+
+<Warning>
+  `SecretBinding` is deprecated. New deployments should use `CredentialsBinding` from the `security.gardener.cloud/v1alpha1` API group, which supports Secrets, InternalSecrets, and WorkloadIdentity resources.
+</Warning>
+
+### SecretBinding example
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: SecretBinding
+metadata:
+  name: my-provider-account
+  namespace: garden-dev
+provider:
+  type: aws
+secretRef:
+  name: my-aws-credentials
+  namespace: garden-dev
+quotas: []
+```
+
+### CredentialsBinding (security.gardener.cloud) example
+
+```yaml
+apiVersion: security.gardener.cloud/v1alpha1
+kind: CredentialsBinding
+metadata:
+  name: my-provider-account
+  namespace: garden-dev
+provider:
+  type: aws
+credentialsRef:
+  apiVersion: v1
+  kind: Secret
+  name: my-aws-credentials
+quotas: []
+```
+
+  </Accordion>
+
+  <Accordion title="BackupBucket and BackupEntry">
+
+`BackupBucket` represents a cloud storage bucket used to store etcd backup snapshots for shoot clusters. `BackupEntry` maps a specific shoot's etcd backup data to a bucket.
+
+### BackupBucket spec fields
+
+<ParamField path="spec.provider.type" type="string" required>
+  The cloud provider type for the backup storage (e.g., `aws`, `gcp`, `azure`).
+</ParamField>
+
+<ParamField path="spec.provider.region" type="string" required>
+  The region where the backup bucket is created.
+</ParamField>
+
+<ParamField path="spec.credentialsRef" type="object" required>
+  Reference to the Secret containing cloud provider credentials for bucket management.
+</ParamField>
+
+<ParamField path="spec.seedName" type="string">
+  Name of the Seed that manages this BackupBucket.
+</ParamField>
+
+### BackupEntry spec fields
+
+<ParamField path="spec.bucketName" type="string" required>
+  Name of the BackupBucket this entry belongs to.
+</ParamField>
+
+<ParamField path="spec.seedName" type="string">
+  Name of the Seed that manages this BackupEntry.
+</ParamField>
+
+### Example
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: BackupBucket
+metadata:
+  name: my-backup-bucket
+spec:
+  provider:
+    type: aws
+    region: eu-west-1
+  credentialsRef:
+    apiVersion: v1
+    kind: Secret
+    name: backup-credentials
+    namespace: garden
+  seedName: my-seed
+```
+
+<Note>
+  BackupBuckets and BackupEntries are typically managed automatically by Gardener and gardenlet based on the Seed's backup configuration. You rarely need to create them manually.
+</Note>
+
+  </Accordion>
+
+  <Accordion title="NamespacedCloudProfile">
+
+The `NamespacedCloudProfile` resource lets project members extend a parent `CloudProfile` with project-specific machine types, OS images, or Kubernetes version overrides without modifying the global profile. It lives in a project namespace and is referenced from `Shoot` resources as an alternative to `CloudProfile`.
+
+### Key spec fields
+
+| Field | Type | Description |
+|---|---|---|
+| `spec.parent` | object | Reference to the parent `CloudProfile` (`kind: CloudProfile`, `name: <name>`) |
+| `spec.machineTypes` | array | Additional machine types not present in the parent profile |
+| `spec.machineImages` | array | Additional OS image versions |
+| `spec.kubernetes.versions` | array | Additional or overridden Kubernetes versions |
+
+### Example
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: NamespacedCloudProfile
+metadata:
+  name: my-custom-profile
+  namespace: garden-my-project
+spec:
+  parent:
+    kind: CloudProfile
+    name: aws
+  machineTypes:
+  - name: m5.metal
+    cpu: "96"
+    gpu: "0"
+    memory: 384Gi
+    usable: true
+```
+
+Reference the `NamespacedCloudProfile` from a Shoot:
+
+```yaml
+spec:
+  cloudProfile:
+    kind: NamespacedCloudProfile
+    name: my-custom-profile
+```
+
+  </Accordion>
+
+  <Accordion title="ControllerRegistration and ControllerDeployment">
+
+`ControllerRegistration` and `ControllerDeployment` are the low-level resources that register extension controllers with Gardener. In most cases, you use the higher-level `Extension` resource (in `operator.gardener.cloud`) which manages these automatically. Direct use is needed for advanced scenarios.
+
+**ControllerRegistration** declares which extension resource kinds and types an extension controller handles.
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerRegistration
+metadata:
+  name: provider-aws
+spec:
+  resources:
+  - kind: Infrastructure
+    type: aws
+    primary: true
+    workerlessSupported: false
+  - kind: Worker
+    type: aws
+    primary: true
+  - kind: ControlPlane
+    type: aws
+    primary: true
+  deployment:
+    deploymentRefs:
+    - name: provider-aws
+```
+
+**ControllerDeployment** holds the Helm chart reference and values for deploying the extension to seeds.
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerDeployment
+metadata:
+  name: provider-aws
+helm:
+  ociRepository:
+    ref: europe-docker.pkg.dev/gardener-project/releases/charts/gardener/extensions/provider-aws:v1.2.3
+  values:
+    image:
+      tag: v1.2.3
+```
+
+  </Accordion>
+
+  <Accordion title="ExposureClass">
+
+`ExposureClass` defines how shoot cluster API servers are exposed. It allows operators to offer different exposure topologies (e.g., public internet vs. private intranet) for shoot kube-apiservers.
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: ExposureClass
+metadata:
+  name: internet
+spec:
+  handler: nginx
+  scheduling:
+    seedSelector:
+      matchLabels:
+        exposure: internet
+```
+
+Reference an `ExposureClass` from a Shoot:
+
+```yaml
+spec:
+  exposureClassName: internet
+```
+
+  </Accordion>
+
+  <Accordion title="Quota">
+
+`Quota` limits the total resources (CPU, memory, storage) that can be consumed by all Shoots in a project. It prevents runaway cloud spend by capping machine resources per project.
+
+```yaml
+apiVersion: core.gardener.cloud/v1beta1
+kind: Quota
+metadata:
+  name: my-quota
+  namespace: garden-my-project
+spec:
+  scope:
+    apiVersion: core.gardener.cloud/v1beta1
+    kind: Project
+  clusterLifetimeDays: 30
+  metrics:
+    cpu: "200"
+    memory: 400Gi
+    storage.standard: 500Gi
+    shoots: "10"
+```
+
+  </Accordion>
+
+</AccordionGroup>

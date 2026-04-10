@@ -1,97 +1,76 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Gardener: Kubernetes Clusters at Scale"
+description: "Gardener automates Kubernetes cluster management across any infrastructure using hosted control planes. Deploy and operate homogeneous clusters at scale."
 ---
 
-## Setting up
+Gardener is a Kubernetes-native cluster management platform that lets you provision, operate, and scale Kubernetes clusters across any cloud provider or on-premises infrastructure. By hosting cluster control planes inside Kubernetes itself — the "Kubernetes in Kubernetes" pattern — Gardener delivers homogeneous, conformance-tested clusters with unified configuration across AWS, Azure, GCP, OpenStack, and more.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Architecture Overview" icon="sitemap" href="/concepts/architecture">
+    Understand the garden, seed, and shoot cluster model and how Gardener orchestrates cluster lifecycle.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Get Started Locally" icon="rocket" href="/deployment/getting-started-locally">
+    Run a full Gardener landscape on your local machine using the local provider in minutes.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Set Up a Landscape" icon="server" href="/deployment/setup-gardener">
+    Deploy Gardener on a real Kubernetes cluster and configure your first seed and shoot clusters.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api-reference/overview">
+    Explore the core.gardener.cloud API resources: Shoot, Seed, CloudProfile, and more.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## How Gardener works
 
-Everything you need to create world-class documentation.
+Gardener mirrors the Kubernetes architecture itself. Just as Kubernetes manages containers on nodes, Gardener manages Kubernetes clusters on seed clusters — using the same declarative, controller-based patterns you already know.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+| Gardener Component | Kubernetes Equivalent | Role |
+|---|---|---|
+| `gardener-apiserver` | `kube-apiserver` | Exposes the Gardener API |
+| `gardener-controller-manager` | `kube-controller-manager` | Reconciles Gardener resources |
+| `gardener-scheduler` | `kube-scheduler` | Assigns shoots to seeds |
+| `gardenlet` | `kubelet` | Agent running on each seed cluster |
+| Seed cluster | Worker node | Hosts shoot control planes |
+| Shoot cluster | Pod | End-user Kubernetes cluster |
 
-## Need inspiration?
+<Steps>
+  <Step title="Deploy the Gardener Operator">
+    Install the `gardener-operator` on an existing Kubernetes runtime cluster. It manages the virtual garden cluster and all control plane components.
+  </Step>
+  <Step title="Register a seed cluster">
+    Deploy a `gardenlet` to register a seed cluster. The seed hosts the control planes of your shoot clusters as native Kubernetes workloads.
+  </Step>
+  <Step title="Configure cloud providers">
+    Install provider extensions (AWS, Azure, GCP, OpenStack, etc.) and create `CloudProfile` resources describing available machine types and OS images.
+  </Step>
+  <Step title="Create shoot clusters">
+    Apply a `Shoot` resource to provision a fully managed Kubernetes cluster. Gardener handles etcd, kube-apiserver, updates, backups, and monitoring automatically.
+  </Step>
+</Steps>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="Hosted Control Planes" icon="layer-group" href="/concepts/gardenlet">
+    Shoot cluster control planes run as pods in seed clusters — no dedicated master VMs required, reducing cost and operational overhead.
+  </Card>
+  <Card title="Multi-Cloud Homogeneity" icon="cloud" href="/usage/shoot-clusters">
+    Get identical cluster configuration, behavior, and bill of materials across all supported cloud providers.
+  </Card>
+  <Card title="Extensible Architecture" icon="puzzle-piece" href="/extensions/overview">
+    Add support for new cloud providers, DNS providers, networking plugins, and OS configurations through the extension framework.
+  </Card>
+  <Card title="High Availability" icon="shield-halved" href="/usage/high-availability">
+    Deploy shoot control planes in HA mode across multiple availability zones for production-grade resilience.
+  </Card>
+  <Card title="Automated Operations" icon="rotate" href="/usage/shoot-operations">
+    Automated Kubernetes version upgrades, credential rotation, backup/restore, and maintenance windows.
+  </Card>
+  <Card title="Kubernetes-Native API" icon="terminal" href="/api-reference/core">
+    Manage clusters declaratively using standard kubectl and GitOps workflows against the Gardener API.
+  </Card>
+</CardGroup>
+
+<Note>
+Gardener is a CNCF project certified for Kubernetes conformance across AWS, Azure, GCP, OpenStack, and Alibaba Cloud. It powers production landscapes managing thousands of clusters at SAP and other adopters.
+</Note>
